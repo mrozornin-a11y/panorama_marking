@@ -139,20 +139,33 @@ class PreviewLoader(QObject):
 
 # ---------------------------------------------------------------- графические элементы
 
+class LabelItem(QGraphicsSimpleTextItem):
+    """Номер окружности; при перетаскивании сообщает окну, чтобы сдвинуть номер на второй панораме."""
+    def __init__(self, text, parent, on_moved):
+        super().__init__(text, parent)
+        self.on_moved = on_moved
+
+    def itemChange(self, change, value):
+        if change == QGraphicsSimpleTextItem.GraphicsItemChange.ItemPositionHasChanged and self.on_moved:
+            self.on_moved("label")
+        return super().itemChange(change, value)
+
+
 class CircleItem(QGraphicsEllipseItem):
-    def __init__(self, index, obj, side, settings, editable, pair):
+    def __init__(self, index, obj, side, settings, editable, pair, on_moved):
         r = core.diameter_px(obj["mag"]) / 2
         super().__init__(-r, -r, 2 * r, 2 * r)
         self.index = index
         self.highlight = False
-        color = QColor(core.object_color(obj, settings, pair))
+        self.on_moved = None
+        color = QColor(core.object_color(obj, settings, pair, side))
         self.setPen(QPen(color, settings["circle_line_px"]))
         self.setBrush(Qt.BrushStyle.NoBrush)  # без заливки; щелчок внутри всё равно выбирает окружность
         self.setPos(QPointF(*obj["pos"][side]))
         self.setZValue(-r)  # мелкие окружности поверх крупных
         self.setData(0, index)
 
-        self.label = QGraphicsSimpleTextItem(str(index + 1), self)
+        self.label = LabelItem(str(index + 1), self, None)
         self.label.setFont(make_font(settings["number_font_px"]))
         self.label.setBrush(QBrush(color))
         self.label.setPen(QPen(Qt.PenStyle.NoPen))
@@ -160,9 +173,17 @@ class CircleItem(QGraphicsEllipseItem):
         self.label.setData(0, index)
         if editable:
             flags = QGraphicsEllipseItem.GraphicsItemFlag.ItemIsMovable | \
-                QGraphicsEllipseItem.GraphicsItemFlag.ItemIsSelectable
+                QGraphicsEllipseItem.GraphicsItemFlag.ItemIsSelectable | \
+                QGraphicsEllipseItem.GraphicsItemFlag.ItemSendsGeometryChanges
             self.setFlags(flags)
             self.label.setFlags(flags)
+            self.on_moved = lambda kind: on_moved(index, kind)
+            self.label.on_moved = self.on_moved
+
+    def itemChange(self, change, value):
+        if change == QGraphicsEllipseItem.GraphicsItemChange.ItemPositionHasChanged and self.on_moved:
+            self.on_moved("pos")
+        return super().itemChange(change, value)
 
     def paint(self, painter, option, widget=None):
         opt = QStyleOptionGraphicsItem(option)
@@ -264,7 +285,8 @@ class PanoramaView(QGraphicsView):
         if self.img_size is not None and pair:
             for i, o in enumerate(pair["objects"]):
                 if o["pos"][self.side]:
-                    item = CircleItem(i, o, self.side, settings, editable, pair)
+                    item = CircleItem(i, o, self.side, settings, editable, pair,
+                                      lambda idx, kind: self.main.item_moved(self.side, idx, kind))
                     item.highlight = i == selected
                     self.scene().addItem(item)
                     self.circles[i] = item
@@ -308,7 +330,7 @@ class PanoramaView(QGraphicsView):
             self.ghost.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
             self.scene().addItem(self.ghost)
         s = self.main.project.settings
-        color = QColor(core.object_color(core.new_object(pl["mag"]), s, self.main.pair()))
+        color = QColor(core.object_color(core.new_object(pl["mag"]), s, self.main.pair(), self.side))
         self.ghost.setPen(QPen(color, s["circle_line_px"], Qt.PenStyle.DashLine))
         self.ghost.setBrush(Qt.BrushStyle.NoBrush)
         self.ghost.setRect(-r, -r, 2 * r, 2 * r)
@@ -348,6 +370,7 @@ class PanoramaView(QGraphicsView):
         if self.main.placing:
             self.update_ghost(self.mapToScene(e.position().toPoint()))
             return
+        self.main.move_alone = bool(e.modifiers() & Qt.KeyboardModifier.ShiftModifier)
         super().mouseMoveEvent(e)
 
     def mouseReleaseEvent(self, e):
@@ -422,10 +445,13 @@ class SettingsDialog(QDialog):
             sp.setValue(int(self.s[key]))
             form.addRow(title, sp)
             self.spins[key] = sp
-        self.color_btn = QPushButton()
-        self.color_btn.clicked.connect(self._pick_color)
-        self._show_color()
-        form.addRow("Цвет новых окружностей", self.color_btn)
+        self.color_btns = {}
+        for side in core.SIDES:
+            b = QPushButton()
+            b.clicked.connect(lambda checked=False, sd=side: self._pick_color(sd))
+            form.addRow(f"Цвет по умолчанию: {core.SIDE_TITLES[side].lower()}", b)
+            self.color_btns[side] = b
+        self._show_colors()
         note = QLabel("Размеры указаны в пикселях исходного изображения.")
         note.setObjectName("hint")
         form.addRow(note)
@@ -434,15 +460,17 @@ class SettingsDialog(QDialog):
         bb.rejected.connect(self.reject)
         form.addRow(bb)
 
-    def _show_color(self):
-        self.color_btn.setText(self.s["default_color"])
-        self.color_btn.setIcon(color_icon(self.s["default_color"]))
+    def _show_colors(self):
+        for side, b in self.color_btns.items():
+            b.setText(self.s["color_" + side])
+            b.setIcon(color_icon(self.s["color_" + side]))
 
-    def _pick_color(self):
-        c = QColorDialog.getColor(QColor(self.s["default_color"]), self, "Цвет новых окружностей")
+    def _pick_color(self, side):
+        c = QColorDialog.getColor(QColor(self.s["color_" + side]), self,
+                                  f"Цвет по умолчанию — {core.SIDE_TITLES[side].lower()}")
         if c.isValid():
-            self.s["default_color"] = c.name()
-            self._show_color()
+            self.s["color_" + side] = c.name()
+            self._show_colors()
 
     def result_settings(self):
         for key, sp in self.spins.items():
@@ -475,9 +503,18 @@ class AssignDialog(QDialog):
         return {side: cb.currentData() for side, cb in self.combos.items()}
 
 
-def color_icon(color, size=16):
+def color_icon(*colors, size=16):
+    """Образец цвета; для двух цветов — левая и правая половины (параллельные / скрещённые)."""
     pm = QPixmap(size, size)
-    pm.fill(QColor(color))
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    w = size / len(colors)
+    for n, c in enumerate(colors):
+        p.fillRect(QRectF(n * w, 0, w, size), QColor(c))
+    p.setPen(QPen(QColor("#9ca3af"), 1))
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    p.drawRect(0, 0, size - 1, size - 1)
+    p.end()
     return QIcon(pm)
 
 
@@ -563,6 +600,7 @@ class MainWindow(QMainWindow):
         self.placing = None    # {"mag": ..., "target": индекс или None}
         self.marking = False
         self.syncing = 0
+        self.move_alone = False  # Shift при перетаскивании: двигать только на одной панораме
         self.undo, self.redo = {}, {}
         self.worker = None
         self.last_export_dir = ""
@@ -650,7 +688,8 @@ class MainWindow(QMainWindow):
             b.clicked.connect(lambda checked, k=key: self._tool_clicked(k))
             tl.addWidget(b)
             self.tool_buttons[key] = b
-        hint = QLabel("Щелчок по панораме ставит окружность. Esc — курсор.")
+        hint = QLabel("Щелчок по панораме ставит окружность. Esc — курсор. Перетаскивание сдвигает "
+                      "окружность на обеих панорамах, с Shift — только на одной.")
         hint.setObjectName("hint")
         hint.setWordWrap(True)
         b_unplaced = QPushButton("Добавить неразмещённый снимок")
@@ -679,8 +718,15 @@ class MainWindow(QMainWindow):
         bg.setContentsMargins(0, 0, 0, 0)
         bg.setSpacing(6)
         self.obj_buttons = []
+        self.obj_color_btns = {}
+        for n, side in enumerate(core.SIDES):
+            b = QPushButton(core.SIDE_TITLES[side].split()[0])
+            b.setToolTip(f"Цвет выбранной окружности и её номера — {core.SIDE_TITLES[side].lower()}")
+            b.clicked.connect(lambda checked=False, sd=side: self.change_color(sd))
+            bg.addWidget(b, 0, n)
+            self.obj_buttons.append(b)
+            self.obj_color_btns[side] = b
         for n, (text, slot, tip) in enumerate((
-                ("Цвет…", self.change_color, "Цвет выбранной окружности"),
                 ("Указать положение", self.place_selected,
                  "Следующий щелчок по панораме задаст положение выбранного объекта"),
                 ("Показать", self.goto_selected, "Показать выбранную окружность на панорамах"),
@@ -688,24 +734,32 @@ class MainWindow(QMainWindow):
             b = QPushButton(text)
             b.setToolTip(tip)
             b.clicked.connect(slot)
-            bg.addWidget(b, n // 2, n % 2)
+            if n == 0:
+                bg.addWidget(b, 1, 0, 1, 2)
+            else:
+                bg.addWidget(b, 2, n - 1)
             self.obj_buttons.append(b)
-        self.obj_buttons[3].setObjectName("danger")
-        objects_card, _ = card(self.tree, mag_row, btns, title="Объекты")
+        self.obj_buttons[-1].setObjectName("danger")
+        color_label = QLabel("Цвет окружности")
+        objects_card, _ = card(self.tree, mag_row, color_label, btns, title="Объекты")
 
-        self.pair_color_btn = QPushButton("Один цвет для шлифа…")
-        self.pair_color_btn.setToolTip("Все окружности и номера этого шлифа — выбранным цветом; "
-                                       "другие шлифы не меняются")
-        self.pair_color_btn.clicked.connect(self.set_pair_color)
-        self.pair_color_reset = QPushButton("Сбросить")
-        self.pair_color_reset.setToolTip("Вернуть этому шлифу цвет по умолчанию")
-        self.pair_color_reset.clicked.connect(self.reset_pair_color)
         color_row = QWidget()
-        cr = QHBoxLayout(color_row)
+        cr = QGridLayout(color_row)
         cr.setContentsMargins(0, 0, 0, 0)
-        cr.addWidget(self.pair_color_btn, 1)
-        cr.addWidget(self.pair_color_reset)
-        color_card, _ = card(color_row, title="Цвет шлифа")
+        cr.setSpacing(6)
+        self.pair_color_btns = {}
+        for n, side in enumerate(core.SIDES):
+            b = QPushButton(core.SIDE_TITLES[side].split()[0])
+            b.setToolTip(f"Все окружности и номера этого шлифа на панораме «{core.SIDE_TITLES[side]}» — "
+                         "выбранным цветом; другие шлифы не меняются")
+            b.clicked.connect(lambda checked=False, sd=side: self.set_pair_color(sd))
+            cr.addWidget(b, 0, n)
+            self.pair_color_btns[side] = b
+        self.pair_color_reset = QPushButton("Сбросить цвета шлифа")
+        self.pair_color_reset.setToolTip("Вернуть всем окружностям этого шлифа цвета по умолчанию")
+        self.pair_color_reset.clicked.connect(self.reset_pair_color)
+        cr.addWidget(self.pair_color_reset, 1, 0, 1, 2)
+        color_card, _ = card(color_row, title="Цвет всех окружностей шлифа")
 
         self.right = QWidget()
         rv = QVBoxLayout(self.right)
@@ -751,8 +805,20 @@ class MainWindow(QMainWindow):
         for b in self.obj_buttons:
             b.setEnabled(has)
         self.mag_combo.setEnabled(has)
-        self.pair_color_btn.setEnabled(self.pair() is not None)
-        self.pair_color_reset.setEnabled(bool(self.pair() and self.pair().get("color")))
+        pair = self.pair()
+        s = self.project.settings if self.project else core.DEFAULT_SETTINGS
+        objs = self.objects()
+        for side in core.SIDES:
+            pb = self.pair_color_btns[side]
+            pb.setEnabled(pair is not None)
+            pb.setIcon(color_icon((pair and pair["color"][side]) or s["color_" + side]))
+            ob = self.obj_color_btns[side]
+            if has and self.sel < len(objs):
+                ob.setIcon(color_icon(core.object_color(objs[self.sel], s, pair, side)))
+            else:
+                ob.setIcon(QIcon())
+        self.pair_color_reset.setEnabled(bool(pair) and (any(pair["color"].values()) or
+                                                         any(any(o["color"].values()) for o in objs)))
         busy = self.worker is not None
         self.act_exp_cur.setEnabled(self.project is not None and not busy)
         self.act_exp_all.setEnabled(self.project is not None and not busy)
@@ -956,7 +1022,7 @@ class MainWindow(QMainWindow):
                 text += " — не размещён"
             item = QTreeWidgetItem([text])
             item.setData(0, Qt.ItemDataRole.UserRole, i)
-            item.setIcon(0, color_icon(core.object_color(o, s, self.pair())))
+            item.setIcon(0, color_icon(*(core.object_color(o, s, self.pair(), sd) for sd in core.SIDES)))
             self.tree.addTopLevelItem(item)
             if i == self.sel:
                 item.setSelected(True)
@@ -1104,29 +1170,60 @@ class MainWindow(QMainWindow):
         if self.sel is not None:
             self.start_placing(self.objects()[self.sel]["mag"], target=self.sel)
 
-    def sync_positions(self, side):
-        """Перенос в проект положений окружностей и номеров после перетаскивания мышью."""
+    def item_moved(self, side, index, kind):
+        """Во время перетаскивания сдвигает ту же окружность (или номер) на второй панораме.
+
+        Сдвиг переносится пропорционально размерам панорам; с Shift вторая панорама не меняется.
+        """
+        if self.syncing or not self.project:
+            return
+        other = core.SIDES[1] if side == core.SIDES[0] else core.SIDES[0]
+        src, dst = self.views[side].circles.get(index), self.views[other].circles.get(index)
+        if src is None or dst is None:
+            return
+        o = self.objects()[index]
+        alone = self.move_alone
+        self.syncing += 1
+        if kind == "pos":
+            sizes = {sd: v.img_size for sd, v in self.views.items()}
+            p = src.pos()
+            target = o["pos"][other] if alone else core.linked_position(o, side, [p.x(), p.y()], sizes)
+            dst.setPos(QPointF(*target))
+        else:
+            s = self.project.settings
+            if alone:
+                target = core.label_offset(o, other, s)
+            else:
+                old, old_other = core.label_offset(o, side, s), core.label_offset(o, other, s)
+                lp = src.label.pos()
+                target = [old_other[0] + lp.x() - old[0], old_other[1] + lp.y() - old[1]]
+            dst.label.setPos(QPointF(*target))
+        self.syncing -= 1
+
+    def sync_positions(self, side=None):
+        """Перенос в проект положений окружностей и номеров (на обеих панорамах) после перетаскивания."""
         if not self.project:
             return
         objs = self.objects()
         s = self.project.settings
         updates = []
-        for i, item in self.views[side].circles.items():
-            o = objs[i]
-            p, lp = item.pos(), item.label.pos()
-            old_p, old_l = o["pos"][side], core.label_offset(o, side, s)
-            new_p = [p.x(), p.y()] if abs(p.x() - old_p[0]) + abs(p.y() - old_p[1]) > 0.01 else None
-            new_l = [lp.x(), lp.y()] if abs(lp.x() - old_l[0]) + abs(lp.y() - old_l[1]) > 0.01 else None
-            if new_p or new_l:
-                updates.append((o, new_p, new_l))
+        for sd, view in self.views.items():
+            for i, item in view.circles.items():
+                o = objs[i]
+                p, lp = item.pos(), item.label.pos()
+                old_p, old_l = o["pos"][sd], core.label_offset(o, sd, s)
+                new_p = [p.x(), p.y()] if abs(p.x() - old_p[0]) + abs(p.y() - old_p[1]) > 0.01 else None
+                new_l = [lp.x(), lp.y()] if abs(lp.x() - old_l[0]) + abs(lp.y() - old_l[1]) > 0.01 else None
+                if new_p or new_l:
+                    updates.append((o, sd, new_p, new_l))
         if not updates:
             return
         self.push_undo()
-        for o, new_p, new_l in updates:
+        for o, sd, new_p, new_l in updates:
             if new_p:
-                o["pos"][side] = new_p
+                o["pos"][sd] = new_p
             if new_l:
-                o["label"][side] = new_l
+                o["label"][sd] = new_l
         self.changed()
 
     # --- редактирование
@@ -1142,39 +1239,41 @@ class MainWindow(QMainWindow):
             self.rebuild_tree()
             self.changed()
 
-    def change_color(self):
+    def change_color(self, side):
         if self.sel is None:
             return
         o = self.objects()[self.sel]
-        c = QColorDialog.getColor(QColor(core.object_color(o, self.project.settings, self.pair())), self,
-                                  "Цвет окружности")
+        c = QColorDialog.getColor(QColor(core.object_color(o, self.project.settings, self.pair(), side)), self,
+                                  f"Цвет окружности {self.sel + 1} — {core.SIDE_TITLES[side].lower()}")
         if c.isValid():
             self.push_undo()
-            o["color"] = c.name()
+            o["color"][side] = c.name()
             self.rebuild_circles()
             self.rebuild_tree()
             self.changed()
 
-    def set_pair_color(self):
+    def set_pair_color(self, side):
         pair = self.pair()
         if not pair:
             return
-        start = QColor(pair.get("color") or self.project.settings["default_color"])
-        c = QColorDialog.getColor(start, self, f"Цвет всех окружностей — {pair['name']}")
+        start = QColor(pair["color"][side] or self.project.settings["color_" + side])
+        c = QColorDialog.getColor(start, self,
+                                  f"Цвет всех окружностей — {pair['name']}, {core.SIDE_TITLES[side].lower()}")
         if c.isValid():
-            self._apply_pair_color(c.name())
+            self._apply_pair_color(c.name(), [side])
 
     def reset_pair_color(self):
         if self.pair():
-            self._apply_pair_color(None)
+            self._apply_pair_color(None, core.SIDES)
 
-    def _apply_pair_color(self, color):
-        """Общий цвет шлифа; индивидуальные цвета его окружностей сбрасываются."""
+    def _apply_pair_color(self, color, sides):
+        """Общий цвет шлифа на панорамах sides; индивидуальные цвета там сбрасываются."""
         self.push_undo()
         pair = self.pair()
-        pair["color"] = color
-        for o in pair["objects"]:
-            o["color"] = None
+        for side in sides:
+            pair["color"][side] = color
+            for o in pair["objects"]:
+                o["color"][side] = None
         self.rebuild_circles()
         self.rebuild_tree()
         self.changed()
@@ -1237,7 +1336,7 @@ class MainWindow(QMainWindow):
     # --- отмена / повтор
     def _snapshot(self):
         p = self.pair()
-        return copy.deepcopy({"objects": p["objects"], "color": p.get("color")})
+        return copy.deepcopy({"objects": p["objects"], "color": p["color"]})
 
     def push_undo(self):
         st = self.undo.setdefault(self.cur, [])

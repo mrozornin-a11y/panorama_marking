@@ -31,7 +31,8 @@ DEFAULT_SETTINGS = {
     "scale_line_px": 20,      # толщина линии линейки
     "number_font_px": 200,    # размер шрифта номеров окружностей
     "circle_line_px": 12,     # толщина контура окружностей
-    "default_color": "#ffff00",
+    "color_parallel": "#000000",  # цвет окружностей по умолчанию на параллельных николях
+    "color_crossed": "#ffffff",   # … и на скрещённых
     "jpeg_quality": 93,
     "compress": True,
 }
@@ -78,7 +79,7 @@ def display_name(base):
 
 def new_pair(name, parallel, crossed, problem=""):
     return {"name": name, "parallel": parallel, "crossed": crossed, "problem": problem,
-            "color": None, "objects": []}
+            "color": {"parallel": None, "crossed": None}, "objects": []}
 
 
 def scan_folder(folder):
@@ -111,7 +112,7 @@ def scan_folder(folder):
 # ---------------------------------------------------------------- объекты
 
 def new_object(mag):
-    return {"mag": mag, "color": None,
+    return {"mag": mag, "color": {"parallel": None, "crossed": None},
             "pos": {"parallel": None, "crossed": None},
             "label": {"parallel": None, "crossed": None}}
 
@@ -120,9 +121,17 @@ def is_placed(obj):
     return any(obj["pos"][s] for s in SIDES)
 
 
-def object_color(obj, settings, pair=None):
-    """Цвет объекта: индивидуальный → общий цвет шлифа → цвет по умолчанию."""
-    return obj["color"] or (pair or {}).get("color") or settings["default_color"]
+def object_color(obj, settings, pair, side):
+    """Цвет объекта на панораме side: индивидуальный → общий цвет шлифа → цвет по умолчанию."""
+    pair_color = pair["color"][side] if pair else None
+    return obj["color"][side] or pair_color or settings["color_" + side]
+
+
+def side_colors(value):
+    """Цвета по сторонам из проекта (старые проекты хранили один цвет строкой)."""
+    if isinstance(value, dict):
+        return {s: value.get(s) for s in SIDES}
+    return {s: value for s in SIDES}
 
 
 def place_object(obj, side, x, y, sizes):
@@ -132,6 +141,14 @@ def place_object(obj, side, x, y, sizes):
     for s in SIDES:
         sw, sh = sizes[s]
         obj["pos"][s] = [x, y] if s == side else [rx * sw, ry * sh]
+
+
+def linked_position(obj, side, new, sizes):
+    """Положение на второй панораме после перемещения на side: тот же сдвиг в относительных координатах."""
+    other = SIDES[1] if side == SIDES[0] else SIDES[0]
+    old, old_other = obj["pos"][side], obj["pos"][other]
+    kx, ky = sizes[other][0] / sizes[side][0], sizes[other][1] / sizes[side][1]
+    return [old_other[0] + (new[0] - old[0]) * kx, old_other[1] + (new[1] - old[1]) * ky]
 
 
 def label_offset(obj, side, settings):
@@ -183,7 +200,7 @@ def scale_bar(img_w, img_h, settings):
     tick_top = baseline + 0.15 * f
     tick_bottom = tick_top + tick
     bar_y = (tick_top + tick_bottom) / 2
-    x1 = img_w - max(f, 2 * t)
+    x1 = img_w - t / 2  # правый край штриха совпадает с правым краем изображения
     x0 = x1 - length
     rects = [
         (x0 - t / 2, bar_y - t / 2, x1 + t / 2, bar_y + t / 2),
@@ -239,10 +256,10 @@ class Project:
             pairs = []
             for p in data["pairs"]:
                 pair = new_pair(p["name"], p.get("parallel"), p.get("crossed"), p.get("problem", ""))
-                pair["color"] = p.get("color")
+                pair["color"] = side_colors(p.get("color"))
                 for o in p.get("objects", []):
                     obj = new_object(o["mag"] if o.get("mag") in MAGS else "5")
-                    obj["color"] = o.get("color")
+                    obj["color"] = side_colors(o.get("color"))
                     for key in ("pos", "label"):
                         for s in SIDES:
                             v = (o.get(key) or {}).get(s)
@@ -420,7 +437,7 @@ def export_pair(pair, image_dir, settings, out_root):
             pos = o["pos"][side]
             if not pos:
                 continue
-            rgb = hex_to_rgb(object_color(o, settings, pair))
+            rgb = hex_to_rgb(object_color(o, settings, pair, side))
             cx, cy = ox + pos[0], oy + pos[1]
             draw_circle(canvas, cx, cy, diameter_px(o["mag"]) / 2, rgb, settings)
             dx, dy = label_offset(o, side, settings)
