@@ -7,10 +7,11 @@ from collections import OrderedDict
 from PIL import Image
 from PySide6.QtCore import QObject, QPointF, QRectF, QRunnable, QSize, Qt, QThread, QThreadPool, QTimer, Signal
 from PySide6.QtGui import (QAction, QActionGroup, QBrush, QColor, QFont, QFontMetricsF, QIcon, QImage,
-                           QKeySequence, QPainter, QPen, QPixmap, QShortcut)
+                           QKeySequence, QPainter, QPalette, QPen, QPixmap, QPolygonF, QShortcut)
 from PySide6.QtWidgets import (QAbstractSpinBox, QApplication, QCheckBox, QColorDialog, QComboBox, QDialog,
-                               QDialogButtonBox, QFileDialog, QFormLayout, QGraphicsEllipseItem, QGraphicsScene,
-                               QGraphicsSimpleTextItem, QGraphicsView, QGroupBox, QLabel, QLineEdit,
+                               QDialogButtonBox, QFileDialog, QFormLayout, QFrame, QGraphicsEllipseItem,
+                               QGraphicsScene, QHBoxLayout,
+                               QGraphicsSimpleTextItem, QGraphicsView, QLabel, QLineEdit,
                                QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox, QPlainTextEdit,
                                QProgressDialog, QPushButton, QSpinBox, QSplitter, QStyle,
                                QStyleOptionGraphicsItem, QTextEdit, QToolButton, QTreeWidget, QTreeWidgetItem,
@@ -22,6 +23,44 @@ PREVIEW_MAX = 4096   # максимальная сторона предпрос�
 PREVIEW_CACHE = 6    # сколько предпросмотров держать в памяти
 UNDO_LIMIT = 100
 FONT_FAMILY = "Arial"
+VIEW_BG = "#1f2329"
+
+STYLE = """
+QMainWindow, QDialog { background: #f3f4f6; }
+QToolBar { background: #ffffff; border: none; border-bottom: 1px solid #e5e7eb; padding: 6px 10px; spacing: 4px; }
+QToolBar::separator { width: 1px; background: #e5e7eb; margin: 6px 8px; }
+QToolButton { background: transparent; border: 1px solid transparent; border-radius: 6px; padding: 5px 10px; }
+QToolButton:hover { background: #f1f5f9; border-color: #e2e8f0; }
+QToolButton:checked { background: #dbeafe; border-color: #93c5fd; color: #1d4ed8; }
+QToolButton:disabled { color: #9ca3af; }
+QToolButton#primary { background: #2563eb; color: #ffffff; font-weight: 600; }
+QToolButton#primary:hover { background: #1d4ed8; }
+QToolButton#primary:disabled { background: #bfdbfe; }
+QToolButton#tool { border: 1px solid #e5e7eb; background: #ffffff; padding: 4px 2px; }
+QToolButton#tool:hover { background: #f8fafc; border-color: #cbd5e1; }
+QToolButton#tool:checked { background: #dbeafe; border-color: #3b82f6; color: #1d4ed8; }
+QFrame#card { background: #ffffff; border: 1px solid #e5e7eb; border-radius: 10px; }
+QLabel#header { color: #6b7280; font-size: 8pt; font-weight: 600; }
+QLabel#hint { color: #9ca3af; font-size: 8pt; }
+QLabel#viewTitle { font-weight: 600; color: #111827; padding: 2px 4px 6px 4px; }
+QPushButton { background: #ffffff; border: 1px solid #d1d5db; border-radius: 6px; padding: 6px 12px; }
+QPushButton:hover { background: #f8fafc; border-color: #9ca3af; }
+QPushButton:pressed { background: #eef2f7; }
+QPushButton:disabled { color: #9ca3af; border-color: #e5e7eb; }
+QPushButton#danger { color: #b91c1c; }
+QPushButton#danger:disabled { color: #9ca3af; }
+QListWidget, QTreeWidget { background: #ffffff; border: none; outline: 0; }
+QListWidget::item, QTreeWidget::item { padding: 5px 6px; border-radius: 6px; }
+QListWidget::item:hover, QTreeWidget::item:hover { background: #f1f5f9; }
+QListWidget::item:selected, QTreeWidget::item:selected { background: #dbeafe; color: #1e3a8a; }
+QStatusBar { background: #ffffff; border-top: 1px solid #e5e7eb; color: #4b5563; }
+QSplitter::handle { background: transparent; }
+QGraphicsView { border: none; border-radius: 6px; }
+QToolTip { background: #111827; color: #ffffff; border: none; padding: 4px 8px; }
+QMenu { background: #ffffff; border: 1px solid #e5e7eb; padding: 4px; }
+QMenu::item { padding: 6px 18px; border-radius: 4px; }
+QMenu::item:selected { background: #dbeafe; color: #1e3a8a; }
+"""
 
 
 def make_font(px):
@@ -101,16 +140,14 @@ class PreviewLoader(QObject):
 # ---------------------------------------------------------------- графические элементы
 
 class CircleItem(QGraphicsEllipseItem):
-    def __init__(self, index, obj, side, settings, editable):
+    def __init__(self, index, obj, side, settings, editable, pair):
         r = core.diameter_px(obj["mag"]) / 2
         super().__init__(-r, -r, 2 * r, 2 * r)
         self.index = index
         self.highlight = False
-        color = QColor(core.object_color(obj, settings))
+        color = QColor(core.object_color(obj, settings, pair))
         self.setPen(QPen(color, settings["circle_line_px"]))
-        fill = QColor(color)
-        fill.setAlphaF(settings["fill_opacity"] / 100)
-        self.setBrush(QBrush(fill))
+        self.setBrush(Qt.BrushStyle.NoBrush)  # без заливки; щелчок внутри всё равно выбирает окружность
         self.setPos(QPointF(*obj["pos"][side]))
         self.setZValue(-r)  # мелкие окружности поверх крупных
         self.setData(0, index)
@@ -151,7 +188,9 @@ class PanoramaView(QGraphicsView):
         self.setDragMode(QGraphicsView.DragMode.NoDrag)
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
-        self.setBackgroundBrush(QColor(110, 110, 110))
+        self.setBackgroundBrush(QColor(VIEW_BG))
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.viewport().setMouseTracking(True)
         self.scene().selectionChanged.connect(self._selection_changed)
@@ -172,9 +211,10 @@ class PanoramaView(QGraphicsView):
         self.placeholder, self.scale_items, self.circles, self.ghost = [], [], {}, None
         self.img_size = size
         w, h = size or (4632, 3488)
-        rect = self.scene().addRect(QRectF(0, 0, w, h), QPen(Qt.PenStyle.NoPen), QBrush(QColor(200, 200, 200)))
+        rect = self.scene().addRect(QRectF(0, 0, w, h), QPen(Qt.PenStyle.NoPen), QBrush(QColor("#2d323a")))
         rect.setZValue(-1e6)
         text = self.scene().addSimpleText(message, make_font(w / 30))
+        text.setBrush(QColor("#9ca3af"))
         text.setPos((w - text.boundingRect().width()) / 2, (h - text.boundingRect().height()) / 2)
         text.setZValue(-1e6)
         self.placeholder = [rect, text]
@@ -216,15 +256,15 @@ class PanoramaView(QGraphicsView):
         margin = w * 0.02
         self.setSceneRect(QRectF(-margin, -margin, w + 2 * margin, h + sb["field_h"] + 2 * margin))
 
-    def build_circles(self, objects, settings, editable, selected):
+    def build_circles(self, pair, settings, editable, selected):
         self.main.syncing += 1
         for it in self.circles.values():
             self.scene().removeItem(it)
         self.circles = {}
-        if self.img_size is not None:
-            for i, o in enumerate(objects):
+        if self.img_size is not None and pair:
+            for i, o in enumerate(pair["objects"]):
                 if o["pos"][self.side]:
-                    item = CircleItem(i, o, self.side, settings, editable)
+                    item = CircleItem(i, o, self.side, settings, editable, pair)
                     item.highlight = i == selected
                     self.scene().addItem(item)
                     self.circles[i] = item
@@ -268,12 +308,9 @@ class PanoramaView(QGraphicsView):
             self.ghost.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
             self.scene().addItem(self.ghost)
         s = self.main.project.settings
-        color = QColor(s["default_color"])
-        pen = QPen(color, s["circle_line_px"], Qt.PenStyle.DashLine)
-        fill = QColor(color)
-        fill.setAlphaF(0.35)
-        self.ghost.setPen(pen)
-        self.ghost.setBrush(QBrush(fill))
+        color = QColor(core.object_color(core.new_object(pl["mag"]), s, self.main.pair()))
+        self.ghost.setPen(QPen(color, s["circle_line_px"], Qt.PenStyle.DashLine))
+        self.ghost.setBrush(Qt.BrushStyle.NoBrush)
         self.ghost.setRect(-r, -r, 2 * r, 2 * r)
         self.ghost.setPos(scene_pos)
         self.ghost.show()
@@ -378,7 +415,6 @@ class SettingsDialog(QDialog):
                 ("scale_line_px", "Толщина линии масштабной линейки", 1, 500, " px"),
                 ("number_font_px", "Размер шрифта номеров окружностей", 10, 3000, " px"),
                 ("circle_line_px", "Толщина контура окружностей", 1, 500, " px"),
-                ("fill_opacity", "Непрозрачность заливки окружностей", 0, 100, " %"),
                 ("jpeg_quality", "Качество JPEG при экспорте", 50, 100, "")):
             sp = QSpinBox()
             sp.setRange(lo, hi)
@@ -391,7 +427,7 @@ class SettingsDialog(QDialog):
         self._show_color()
         form.addRow("Цвет новых окружностей", self.color_btn)
         note = QLabel("Размеры указаны в пикселях исходного изображения.")
-        note.setStyleSheet("color: gray")
+        note.setObjectName("hint")
         form.addRow(note)
         bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         bb.accepted.connect(self.accept)
@@ -445,17 +481,50 @@ def color_icon(color, size=16):
     return QIcon(pm)
 
 
-def mag_icon(mag):
-    pm = QPixmap(48, 48)
+def _icon(draw):
+    pm = QPixmap(64, 64)
     pm.fill(Qt.GlobalColor.transparent)
     p = QPainter(pm)
     p.setRenderHint(QPainter.RenderHint.Antialiasing)
-    d = 6 + 38 * core.MAG_DIAMETER_MM[mag] / core.MAG_DIAMETER_MM["2.5"]
-    p.setPen(QPen(QColor(150, 120, 0), 2))
-    p.setBrush(QColor(255, 255, 0, 120))
-    p.drawEllipse(QRectF(24 - d / 2, 24 - d / 2, d, d))
+    draw(p)
     p.end()
     return QIcon(pm)
+
+
+def mag_icon(mag):
+    d = 10 + 48 * core.MAG_DIAMETER_MM[mag] / core.MAG_DIAMETER_MM["2.5"]
+
+    def draw(p):
+        p.setPen(QPen(QColor("#ca8a04"), 4))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawEllipse(QRectF(32 - d / 2, 32 - d / 2, d, d))
+    return _icon(draw)
+
+
+def cursor_icon():
+    def draw(p):
+        p.setPen(QPen(QColor("#1f2937"), 3, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap,
+                      Qt.PenJoinStyle.RoundJoin))
+        p.setBrush(QColor("#ffffff"))
+        pts = [(20, 8), (20, 50), (30, 40), (37, 56), (44, 53), (37, 37), (50, 37)]
+        p.drawPolygon(QPolygonF([QPointF(x, y) for x, y in pts]))
+    return _icon(draw)
+
+
+def card(*widgets, title=None):
+    """Белая карточка с необязательным заголовком."""
+    frame = QFrame()
+    frame.setObjectName("card")
+    lay = QVBoxLayout(frame)
+    lay.setContentsMargins(10, 10, 10, 10)
+    lay.setSpacing(8)
+    if title:
+        h = QLabel(title.upper())
+        h.setObjectName("header")
+        lay.addWidget(h)
+    for w in widgets:
+        lay.addWidget(w)
+    return frame, lay
 
 
 # ---------------------------------------------------------------- экспорт в фоне
@@ -507,8 +576,9 @@ class MainWindow(QMainWindow):
     def _build_ui(self):
         tb = self.addToolBar("Главная")
         tb.setMovable(False)
+        tb.setFloatable(False)
         tb.addAction("Новый проект…", self.new_project)
-        tb.addAction("Открыть проект…", self.open_project)
+        tb.addAction("Открыть…", self.open_project)
         tb.addAction("Сохранить", self.save_project).setToolTip("Сохранить проект (Ctrl+S)")
         tb.addSeparator()
         group = QActionGroup(self)
@@ -521,106 +591,145 @@ class MainWindow(QMainWindow):
         self.act_mark.triggered.connect(lambda: self.set_marking(True))
         tb.addSeparator()
         tb.addAction("Показать целиком", self.fit_views)
-        tb.addAction("Настройки…", self.edit_settings)
-        tb.addSeparator()
+        tb.addAction("Настройки", self.edit_settings)
+        spacer = QWidget()
+        spacer.setSizePolicy(spacer.sizePolicy().Policy.Expanding, spacer.sizePolicy().Policy.Preferred)
+        tb.addWidget(spacer)
         self.compress_cb = QCheckBox("Сжимать изображения")
         self.compress_cb.setChecked(True)
         self.compress_cb.toggled.connect(self._compress_toggled)
         tb.addWidget(self.compress_cb)
-        self.act_exp_cur = tb.addAction("Экспорт текущего…", lambda: self.export(False))
-        self.act_exp_all = tb.addAction("Экспорт всех…", lambda: self.export(True))
+        tb.addSeparator()
+        self.act_exp_cur = tb.addAction("Экспорт текущего", lambda: self.export(False))
+        self.act_exp_all = tb.addAction("Экспорт всех", lambda: self.export(True))
+        tb.widgetForAction(self.act_exp_all).setObjectName("primary")
 
-        # левая область
-        left = QWidget()
-        lv = QVBoxLayout(left)
-        lv.setContentsMargins(4, 4, 4, 4)
-        lv.addWidget(QLabel("Шлифы"))
+        # левая область — список шлифов
         self.pair_list = QListWidget()
         self.pair_list.currentRowChanged.connect(self.select_pair)
-        lv.addWidget(self.pair_list)
         b_swap = QPushButton("Поменять местами")
         b_swap.setToolTip("Поменять местами изображения параллельных и скрещённых николей")
         b_swap.clicked.connect(self.swap_pair)
         b_assign = QPushButton("Назначить файлы…")
         b_assign.clicked.connect(self.assign_files)
-        lv.addWidget(b_swap)
-        lv.addWidget(b_assign)
+        left, lv = card(self.pair_list, b_swap, b_assign, title="Шлифы")
 
-        # центральная область
+        # центральная область — две панорамы
         center = QSplitter(Qt.Orientation.Horizontal)
+        center.setHandleWidth(8)
         self.views = {}
         for side in core.SIDES:
-            w = QWidget()
-            v = QVBoxLayout(w)
-            v.setContentsMargins(2, 2, 2, 2)
             title = QLabel(core.SIDE_TITLES[side])
+            title.setObjectName("viewTitle")
             title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            title.setStyleSheet("font-weight: bold; font-size: 11pt")
-            v.addWidget(title)
             view = PanoramaView(side, self)
-            v.addWidget(view)
-            center.addWidget(w)
+            frame, _ = card(title, view)
+            center.addWidget(frame)
             self.views[side] = view
 
-        # правая область
-        self.right = QWidget()
-        rv = QVBoxLayout(self.right)
-        rv.setContentsMargins(4, 4, 4, 4)
-        box = QGroupBox("Увеличение")
-        grid = QGridLayout(box)
-        self.mag_buttons = {}
-        for n, mag in enumerate(core.MAGS):
+        # правая область — инструменты разметки
+        tools = QWidget()
+        tl = QHBoxLayout(tools)
+        tl.setContentsMargins(0, 0, 0, 0)
+        tl.setSpacing(4)
+        self.tool_buttons = {}
+        for key, text, icon, tip in (
+                [("cursor", "Курсор", cursor_icon(), "Выбор и перемещение окружностей и номеров (Esc)")] +
+                [(m, core.mag_label(m), mag_icon(m),
+                  f"Размещение окружностей {core.mag_label(m)} — {core.MAG_DIAMETER_MM[m]} мм "
+                  f"(клавиша {n + 1})") for n, m in enumerate(core.MAGS)]):
             b = QToolButton()
-            b.setText(f"{core.mag_label(mag)}\n{core.MAG_DIAMETER_MM[mag]} мм")
-            b.setIcon(mag_icon(mag))
-            b.setIconSize(QSize(48, 48))
+            b.setObjectName("tool")
+            b.setText(text)
+            b.setIcon(icon)
+            b.setIconSize(QSize(32, 32))
             b.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
             b.setCheckable(True)
-            b.setToolTip(f"Размещение окружностей {core.mag_label(mag)} (клавиша {n + 1}); Esc — выход")
-            b.clicked.connect(lambda checked, m=mag: self._mag_clicked(m))
-            grid.addWidget(b, n // 2, n % 2)
-            self.mag_buttons[mag] = b
-        rv.addWidget(box)
+            b.setToolTip(tip)
+            b.setSizePolicy(b.sizePolicy().Policy.Expanding, b.sizePolicy().Policy.Fixed)
+            b.clicked.connect(lambda checked, k=key: self._tool_clicked(k))
+            tl.addWidget(b)
+            self.tool_buttons[key] = b
+        hint = QLabel("Щелчок по панораме ставит окружность. Esc — курсор.")
+        hint.setObjectName("hint")
+        hint.setWordWrap(True)
         b_unplaced = QPushButton("Добавить неразмещённый снимок")
         menu = QMenu(b_unplaced)
         for mag in core.MAGS:
             menu.addAction(core.mag_label(mag), lambda m=mag: self.add_unplaced(m))
         b_unplaced.setMenu(menu)
-        rv.addWidget(b_unplaced)
-        rv.addWidget(QLabel("Объекты"))
+        tools_card, _ = card(tools, hint, b_unplaced, title="Инструменты")
+
         self.tree = QTreeWidget()
         self.tree.setHeaderHidden(True)
         self.tree.setRootIsDecorated(False)
         self.tree.itemSelectionChanged.connect(self._tree_selection)
         self.tree.itemDoubleClicked.connect(lambda *_: self.goto_selected())
-        rv.addWidget(self.tree)
-        form = QFormLayout()
         self.mag_combo = QComboBox()
         for mag in core.MAGS:
             self.mag_combo.addItem(core.mag_label(mag), mag)
         self.mag_combo.activated.connect(self._mag_changed)
-        form.addRow("Увеличение:", self.mag_combo)
-        rv.addLayout(form)
+        mag_row = QWidget()
+        mr = QHBoxLayout(mag_row)
+        mr.setContentsMargins(0, 0, 0, 0)
+        mr.addWidget(QLabel("Увеличение"))
+        mr.addWidget(self.mag_combo, 1)
+        btns = QWidget()
+        bg = QGridLayout(btns)
+        bg.setContentsMargins(0, 0, 0, 0)
+        bg.setSpacing(6)
         self.obj_buttons = []
-        for text, slot in (("Цвет…", self.change_color),
-                           ("Указать положение", self.place_selected),
-                           ("Показать на панораме", self.goto_selected),
-                           ("Удалить", self.delete_selected)):
+        for n, (text, slot, tip) in enumerate((
+                ("Цвет…", self.change_color, "Цвет выбранной окружности"),
+                ("Указать положение", self.place_selected,
+                 "Следующий щелчок по панораме задаст положение выбранного объекта"),
+                ("Показать", self.goto_selected, "Показать выбранную окружность на панорамах"),
+                ("Удалить", self.delete_selected, "Удалить выбранный объект (Delete)"))):
             b = QPushButton(text)
+            b.setToolTip(tip)
             b.clicked.connect(slot)
-            rv.addWidget(b)
+            bg.addWidget(b, n // 2, n % 2)
             self.obj_buttons.append(b)
-        self.obj_buttons[1].setToolTip("Следующий щелчок по панораме задаст положение выбранного объекта")
+        self.obj_buttons[3].setObjectName("danger")
+        objects_card, _ = card(self.tree, mag_row, btns, title="Объекты")
+
+        self.pair_color_btn = QPushButton("Один цвет для шлифа…")
+        self.pair_color_btn.setToolTip("Все окружности и номера этого шлифа — выбранным цветом; "
+                                       "другие шлифы не меняются")
+        self.pair_color_btn.clicked.connect(self.set_pair_color)
+        self.pair_color_reset = QPushButton("Сбросить")
+        self.pair_color_reset.setToolTip("Вернуть этому шлифу цвет по умолчанию")
+        self.pair_color_reset.clicked.connect(self.reset_pair_color)
+        color_row = QWidget()
+        cr = QHBoxLayout(color_row)
+        cr.setContentsMargins(0, 0, 0, 0)
+        cr.addWidget(self.pair_color_btn, 1)
+        cr.addWidget(self.pair_color_reset)
+        color_card, _ = card(color_row, title="Цвет шлифа")
+
+        self.right = QWidget()
+        rv = QVBoxLayout(self.right)
+        rv.setContentsMargins(0, 0, 0, 0)
+        rv.setSpacing(8)
+        rv.addWidget(tools_card)
+        rv.addWidget(objects_card, 1)
+        rv.addWidget(color_card)
         self.right.setVisible(False)
 
         split = QSplitter(Qt.Orientation.Horizontal)
+        split.setHandleWidth(8)
         split.addWidget(left)
         split.addWidget(center)
         split.addWidget(self.right)
         split.setStretchFactor(1, 1)
-        split.setSizes([220, 1200, 260])
-        self.setCentralWidget(split)
+        split.setSizes([230, 1200, 320])
+        outer = QWidget()
+        ol = QVBoxLayout(outer)
+        ol.setContentsMargins(8, 8, 8, 8)
+        ol.addWidget(split)
+        self.setCentralWidget(outer)
         self._update_controls()
+        self._update_mag_buttons()
 
         for key, fn in (("1", lambda: self.start_placing("2.5")), ("2", lambda: self.start_placing("5")),
                         ("3", lambda: self.start_placing("10")), ("4", lambda: self.start_placing("20")),
@@ -642,6 +751,8 @@ class MainWindow(QMainWindow):
         for b in self.obj_buttons:
             b.setEnabled(has)
         self.mag_combo.setEnabled(has)
+        self.pair_color_btn.setEnabled(self.pair() is not None)
+        self.pair_color_reset.setEnabled(bool(self.pair() and self.pair().get("color")))
         busy = self.worker is not None
         self.act_exp_cur.setEnabled(self.project is not None and not busy)
         self.act_exp_all.setEnabled(self.project is not None and not busy)
@@ -823,7 +934,7 @@ class MainWindow(QMainWindow):
                 else:
                     view.load(None, f"Не удалось загрузить:\n{pair[side]}\n{self.loader.errors.get(path, '')}")
                     view.build_scale(self.project.settings)
-                    view.build_circles([], self.project.settings, False, None)
+                    view.build_circles(None, self.project.settings, False, None)
 
     def fit_views(self):
         for v in self.views.values():
@@ -833,7 +944,7 @@ class MainWindow(QMainWindow):
         if not self.project:
             return
         for v in self.views.values():
-            v.build_circles(self.objects(), self.project.settings, self.marking, self.sel)
+            v.build_circles(self.pair(), self.project.settings, self.marking, self.sel)
 
     def rebuild_tree(self):
         self.tree.blockSignals(True)
@@ -845,7 +956,7 @@ class MainWindow(QMainWindow):
                 text += " — не размещён"
             item = QTreeWidgetItem([text])
             item.setData(0, Qt.ItemDataRole.UserRole, i)
-            item.setIcon(0, color_icon(core.object_color(o, s)))
+            item.setIcon(0, color_icon(core.object_color(o, s, self.pair())))
             self.tree.addTopLevelItem(item)
             if i == self.sel:
                 item.setSelected(True)
@@ -912,11 +1023,12 @@ class MainWindow(QMainWindow):
         self.set_selection(items[0].data(0, Qt.ItemDataRole.UserRole) if items else None, source="tree")
 
     # --- размещение
-    def _mag_clicked(self, mag):
-        if self.placing and self.placing["mag"] == mag and self.placing["target"] is None:
+    def _tool_clicked(self, key):
+        if key == "cursor" or (self.placing and self.placing["mag"] == key and self.placing["target"] is None):
             self.stop_placing()
+            self._update_mag_buttons()
         else:
-            self.start_placing(mag)
+            self.start_placing(key)
 
     def _can_place(self):
         pair = self.pair()
@@ -952,8 +1064,11 @@ class MainWindow(QMainWindow):
         self.statusBar().clearMessage()
 
     def _update_mag_buttons(self):
-        for mag, b in self.mag_buttons.items():
-            b.setChecked(bool(self.placing) and self.placing["target"] is None and self.placing["mag"] == mag)
+        for key, b in self.tool_buttons.items():
+            if key == "cursor":
+                b.setChecked(not self.placing)
+            else:
+                b.setChecked(bool(self.placing) and self.placing["target"] is None and self.placing["mag"] == key)
 
     def place_at(self, side, x, y):
         if not self._can_place() or not self.placing:
@@ -1031,13 +1146,38 @@ class MainWindow(QMainWindow):
         if self.sel is None:
             return
         o = self.objects()[self.sel]
-        c = QColorDialog.getColor(QColor(core.object_color(o, self.project.settings)), self, "Цвет окружности")
+        c = QColorDialog.getColor(QColor(core.object_color(o, self.project.settings, self.pair())), self,
+                                  "Цвет окружности")
         if c.isValid():
             self.push_undo()
             o["color"] = c.name()
             self.rebuild_circles()
             self.rebuild_tree()
             self.changed()
+
+    def set_pair_color(self):
+        pair = self.pair()
+        if not pair:
+            return
+        start = QColor(pair.get("color") or self.project.settings["default_color"])
+        c = QColorDialog.getColor(start, self, f"Цвет всех окружностей — {pair['name']}")
+        if c.isValid():
+            self._apply_pair_color(c.name())
+
+    def reset_pair_color(self):
+        if self.pair():
+            self._apply_pair_color(None)
+
+    def _apply_pair_color(self, color):
+        """Общий цвет шлифа; индивидуальные цвета его окружностей сбрасываются."""
+        self.push_undo()
+        pair = self.pair()
+        pair["color"] = color
+        for o in pair["objects"]:
+            o["color"] = None
+        self.rebuild_circles()
+        self.rebuild_tree()
+        self.changed()
 
     def delete_selected(self):
         if self.sel is None or not self.pair():
@@ -1095,9 +1235,13 @@ class MainWindow(QMainWindow):
         self.changed()
 
     # --- отмена / повтор
+    def _snapshot(self):
+        p = self.pair()
+        return copy.deepcopy({"objects": p["objects"], "color": p.get("color")})
+
     def push_undo(self):
         st = self.undo.setdefault(self.cur, [])
-        st.append(copy.deepcopy(self.objects()))
+        st.append(self._snapshot())
         del st[:-UNDO_LIMIT]
         self.redo[self.cur] = []
 
@@ -1105,8 +1249,10 @@ class MainWindow(QMainWindow):
         stack = src.get(self.cur)
         if not stack or not self.pair():
             return
-        dst.setdefault(self.cur, []).append(copy.deepcopy(self.objects()))
-        self.pair()["objects"] = stack.pop()
+        dst.setdefault(self.cur, []).append(self._snapshot())
+        snap = stack.pop()
+        self.pair()["objects"] = snap["objects"]
+        self.pair()["color"] = snap["color"]
         if self.sel is not None and self.sel >= len(self.objects()):
             self.sel = None
         self.stop_placing()
@@ -1183,9 +1329,27 @@ class MainWindow(QMainWindow):
         e.accept()
 
 
+def apply_style(app):
+    app.setStyle("Fusion")
+    pal = QPalette()
+    for role, color in ((QPalette.ColorRole.Window, "#f3f4f6"), (QPalette.ColorRole.Base, "#ffffff"),
+                        (QPalette.ColorRole.AlternateBase, "#f9fafb"), (QPalette.ColorRole.Button, "#ffffff"),
+                        (QPalette.ColorRole.Text, "#1f2937"), (QPalette.ColorRole.WindowText, "#1f2937"),
+                        (QPalette.ColorRole.ButtonText, "#1f2937"), (QPalette.ColorRole.Highlight, "#2563eb"),
+                        (QPalette.ColorRole.HighlightedText, "#ffffff"), (QPalette.ColorRole.ToolTipBase, "#111827"),
+                        (QPalette.ColorRole.ToolTipText, "#ffffff")):
+        pal.setColor(role, QColor(color))
+    app.setPalette(pal)
+    font = QFont("Segoe UI")
+    font.setPointSize(10)
+    app.setFont(font)
+    app.setStyleSheet(STYLE)
+
+
 def main():
     app = QApplication(sys.argv)
     app.setApplicationName("Разметка панорам шлифов")
+    apply_style(app)
     w = MainWindow()
     w.resize(1600, 900)
     w.showMaximized()

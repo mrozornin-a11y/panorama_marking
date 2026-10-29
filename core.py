@@ -32,7 +32,6 @@ DEFAULT_SETTINGS = {
     "number_font_px": 200,    # размер шрифта номеров окружностей
     "circle_line_px": 12,     # толщина контура окружностей
     "default_color": "#ffff00",
-    "fill_opacity": 20,       # непрозрачность заливки окружностей, %
     "jpeg_quality": 93,
     "compress": True,
 }
@@ -78,7 +77,8 @@ def display_name(base):
 
 
 def new_pair(name, parallel, crossed, problem=""):
-    return {"name": name, "parallel": parallel, "crossed": crossed, "problem": problem, "objects": []}
+    return {"name": name, "parallel": parallel, "crossed": crossed, "problem": problem,
+            "color": None, "objects": []}
 
 
 def scan_folder(folder):
@@ -120,8 +120,9 @@ def is_placed(obj):
     return any(obj["pos"][s] for s in SIDES)
 
 
-def object_color(obj, settings):
-    return obj["color"] or settings["default_color"]
+def object_color(obj, settings, pair=None):
+    """Цвет объекта: индивидуальный → общий цвет шлифа → цвет по умолчанию."""
+    return obj["color"] or (pair or {}).get("color") or settings["default_color"]
 
 
 def place_object(obj, side, x, y, sizes):
@@ -166,21 +167,24 @@ def choose_scale_mm(width_mm):
 
 def scale_field_height(settings):
     f, t = settings["scale_font_px"], settings["scale_line_px"]
-    return math.ceil(0.5 * f + 0.95 * f + 0.3 * f + max(3 * t, 0.4 * f) + 0.5 * f)
+    return math.ceil(0.9 * f + 0.15 * f + max(2.5 * t, 0.3 * f) + 0.2 * f)
 
 
 def scale_bar(img_w, img_h, settings):
-    """Геометрия линейки в координатах исходного изображения (белое поле начинается с y = img_h)."""
+    """Геометрия линейки в координатах исходного изображения (белое поле начинается с y = img_h).
+
+    Линейка прижата к правому краю, подпись над ней; поле по высоте минимальное.
+    """
     f, t = settings["scale_font_px"], settings["scale_line_px"]
     mm = choose_scale_mm(img_w * MM_PER_PX)
     length = mm / MM_PER_PX
-    tick = max(3 * t, 0.4 * f)
-    baseline = img_h + 0.5 * f + 0.95 * f
-    tick_top = baseline + 0.3 * f
+    tick = max(2.5 * t, 0.3 * f)
+    baseline = img_h + 0.9 * f
+    tick_top = baseline + 0.15 * f
     tick_bottom = tick_top + tick
     bar_y = (tick_top + tick_bottom) / 2
-    x0 = max(f, 2 * t)
-    x1 = x0 + length
+    x1 = img_w - max(f, 2 * t)
+    x0 = x1 - length
     rects = [
         (x0 - t / 2, bar_y - t / 2, x1 + t / 2, bar_y + t / 2),
         (x0 - t / 2, tick_top, x0 + t / 2, tick_bottom),
@@ -235,6 +239,7 @@ class Project:
             pairs = []
             for p in data["pairs"]:
                 pair = new_pair(p["name"], p.get("parallel"), p.get("crossed"), p.get("problem", ""))
+                pair["color"] = p.get("color")
                 for o in p.get("objects", []):
                     obj = new_object(o["mag"] if o.get("mag") in MAGS else "5")
                     obj["color"] = o.get("color")
@@ -314,7 +319,7 @@ def draw_scale(draw, sb, ox, oy, settings):
 
 
 def draw_circle(canvas, cx, cy, r, rgb, settings):
-    """Сглаженная полупрозрачная окружность (рисуется с суперсэмплингом по фрагменту)."""
+    """Сглаженный контур окружности без заливки (суперсэмплинг по фрагменту)."""
     line = settings["circle_line_px"]
     outer = r + line / 2
     x0 = max(0, math.floor(cx - outer) - 2)
@@ -328,9 +333,6 @@ def draw_circle(canvas, cx, cy, r, rgb, settings):
     ov = Image.new("RGBA", ((x1 - x0) * ss, (y1 - y0) * ss), (0, 0, 0, 0))
     d = ImageDraw.Draw(ov)
     c = ((cx - x0) * ss, (cy - y0) * ss)
-    alpha = round(255 * settings["fill_opacity"] / 100)
-    if alpha:
-        d.ellipse([c[0] - r * ss, c[1] - r * ss, c[0] + r * ss, c[1] + r * ss], fill=rgb + (alpha,))
     R = outer * ss
     d.ellipse([c[0] - R, c[1] - R, c[0] + R, c[1] + R], outline=rgb + (255,), width=max(1, round(line * ss)))
     if ss > 1:
@@ -418,7 +420,7 @@ def export_pair(pair, image_dir, settings, out_root):
             pos = o["pos"][side]
             if not pos:
                 continue
-            rgb = hex_to_rgb(object_color(o, settings))
+            rgb = hex_to_rgb(object_color(o, settings, pair))
             cx, cy = ox + pos[0], oy + pos[1]
             draw_circle(canvas, cx, cy, diameter_px(o["mag"]) / 2, rgb, settings)
             dx, dy = label_offset(o, side, settings)
