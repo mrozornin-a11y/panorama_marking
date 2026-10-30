@@ -1,5 +1,6 @@
 """Оформление панорам петрографических шлифов и разметка участков детальной съёмки."""
 import copy
+import math
 import os
 import sys
 from collections import OrderedDict
@@ -7,10 +8,10 @@ from collections import OrderedDict
 from PIL import Image
 from PySide6.QtCore import QObject, QPointF, QRectF, QRunnable, QSize, Qt, QThread, QThreadPool, QTimer, Signal
 from PySide6.QtGui import (QAction, QActionGroup, QBrush, QColor, QFont, QFontMetricsF, QIcon, QImage,
-                           QKeySequence, QPainter, QPalette, QPen, QPixmap, QPolygonF, QShortcut)
+                           QKeySequence, QPainter, QPainterPath, QPalette, QPen, QPixmap, QPolygonF, QShortcut)
 from PySide6.QtWidgets import (QAbstractSpinBox, QApplication, QCheckBox, QColorDialog, QComboBox, QDialog,
                                QDialogButtonBox, QFileDialog, QFormLayout, QFrame, QGraphicsEllipseItem,
-                               QGraphicsScene, QHBoxLayout,
+                               QGraphicsItem, QGraphicsScene, QButtonGroup, QInputDialog, QRadioButton, QHBoxLayout,
                                QGraphicsSimpleTextItem, QGraphicsView, QLabel, QLineEdit,
                                QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox, QPlainTextEdit,
                                QProgressDialog, QPushButton, QSpinBox, QSplitter, QStyle,
@@ -86,7 +87,7 @@ class _LoadTask(QRunnable):
                 im.draft("RGB", (PREVIEW_MAX, PREVIEW_MAX))
                 img = core.to_rgb(im)
                 img.thumbnail((PREVIEW_MAX, PREVIEW_MAX), Image.Resampling.LANCZOS)
-            data = img.tobytes("raw", "RGB")
+                data = img.tobytes("raw", "RGB")  # пока файл открыт: небольшое RGB-изображение не копируется
             qimg = QImage(data, img.width, img.height, 3 * img.width, QImage.Format.Format_RGB888).copy()
             self.signals.done.emit(self.path, qimg, "")
         except Exception as e:  # noqa: BLE001 — показать пользователю любую ошибку чтения
@@ -153,7 +154,8 @@ class LabelItem(QGraphicsSimpleTextItem):
 
 class CircleItem(QGraphicsEllipseItem):
     def __init__(self, index, obj, side, settings, editable, pair, on_moved):
-        r = core.diameter_px(obj["mag"]) / 2
+        r = core.diameter_px(obj["mag"], core.pair_scale(pair, side)) / 2
+        settings = core.side_settings(settings, pair, side)
         super().__init__(-r, -r, 2 * r, 2 * r)
         self.index = index
         self.highlight = False
@@ -169,7 +171,7 @@ class CircleItem(QGraphicsEllipseItem):
         self.label.setFont(make_font(settings["number_font_px"]))
         self.label.setBrush(QBrush(color))
         self.label.setPen(QPen(Qt.PenStyle.NoPen))
-        self.label.setPos(QPointF(*core.label_offset(obj, side, settings)))
+        self.label.setPos(QPointF(*core.label_offset(obj, side, settings, pair)))
         self.label.setData(0, index)
         if editable:
             flags = QGraphicsEllipseItem.GraphicsItemFlag.ItemIsMovable | \
@@ -199,6 +201,39 @@ class CircleItem(QGraphicsEllipseItem):
                 painter.drawEllipse(self.rect())
 
 
+class MarkerItem(QGraphicsItem):
+    """Точка привязки (с номером) или точка калибровки; размер на экране не зависит от масштаба просмотра."""
+    COLOR = QColor("#ff2bd6")
+
+    def __init__(self, text, movable):
+        super().__init__()
+        self.text = text
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations)
+        if movable:
+            self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable)
+            self.setCursor(Qt.CursorShape.SizeAllCursor)
+        self.setZValue(2e6)
+
+    def boundingRect(self):
+        return QRectF(-13, -30, 50, 44)
+
+    def paint(self, p, option, widget=None):
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        path = QPainterPath()
+        path.addEllipse(QPointF(0, 0), 8, 8)
+        for a, b in (((-12, 0), (12, 0)), ((0, -12), (0, 12))):
+            path.moveTo(*a)
+            path.lineTo(*b)
+        font = make_font(18)
+        font.setBold(True)
+        path.addText(QPointF(12, -10), font, self.text)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(QPen(QColor("#ffffff"), 4))
+        p.drawPath(path)
+        p.setPen(QPen(self.COLOR, 2))
+        p.drawPath(path)
+
+
 class PanoramaView(QGraphicsView):
     def __init__(self, side, main):
         super().__init__()
@@ -219,6 +254,8 @@ class PanoramaView(QGraphicsView):
         self.placeholder = []
         self.scale_items = []
         self.circles = {}
+        self.ties = {}                # номер точки привязки → MarkerItem
+        self.calib_items = []         # временные точки калибровки по двум точкам
         self.ghost = None
         self._pan = None
         self._press = None
@@ -230,6 +267,7 @@ class PanoramaView(QGraphicsView):
         self.scene().clear()
         self.main.syncing -= 1
         self.placeholder, self.scale_items, self.circles, self.ghost = [], [], {}, None
+        self.ties, self.calib_items = {}, []
         self.img_size = size
         w, h = size or (4632, 3488)
         rect = self.scene().addRect(QRectF(0, 0, w, h), QPen(Qt.PenStyle.NoPen), QBrush(QColor("#2d323a")))
@@ -253,14 +291,15 @@ class PanoramaView(QGraphicsView):
         item.setZValue(-1e6)
         item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
 
-    def build_scale(self, settings):
+    def build_scale(self, settings, pair):
         for it in self.scale_items:
             self.scene().removeItem(it)
         self.scale_items = []
         if self.img_size is None:
             return
         w, h = self.img_size
-        sb = core.scale_bar(w, h, settings)
+        settings = core.side_settings(settings, pair, self.side)
+        sb = core.scale_bar(w, h, settings, core.pair_scale(pair, self.side))
         no_pen = QPen(Qt.PenStyle.NoPen)
         self.scale_items.append(self.scene().addRect(QRectF(0, h, w, sb["field_h"]), no_pen, QBrush(Qt.GlobalColor.white)))
         for x0, y0, x1, y1 in sb["rects"]:
@@ -292,6 +331,35 @@ class PanoramaView(QGraphicsView):
                     self.circles[i] = item
         self.main.syncing -= 1
 
+    def build_ties(self, pair, visible):
+        for it in self.ties.values():
+            self.scene().removeItem(it)
+        self.ties = {}
+        if not visible or not pair or self.img_size is None:
+            return
+        for n, pt in enumerate(pair["ties"][self.side]):
+            if pt:
+                item = MarkerItem(str(n + 1), movable=True)
+                item.setPos(QPointF(*pt))
+                self.scene().addItem(item)
+                self.ties[n] = item
+
+    def show_calib_points(self, points):
+        for it in self.calib_items:
+            self.scene().removeItem(it)
+        self.calib_items = []
+        for n, pt in enumerate(points):
+            item = MarkerItem("AB"[n], movable=False)
+            item.setPos(QPointF(*pt))
+            self.scene().addItem(item)
+            self.calib_items.append(item)
+        if len(points) == 2:
+            pen = QPen(MarkerItem.COLOR, 2, Qt.PenStyle.DashLine)
+            pen.setCosmetic(True)
+            line = self.scene().addLine(points[0][0], points[0][1], points[1][0], points[1][1], pen)
+            line.setZValue(2e6)
+            self.calib_items.append(line)
+
     def set_highlight(self, index):
         for i, it in self.circles.items():
             if it.highlight != (i == index):
@@ -310,7 +378,7 @@ class PanoramaView(QGraphicsView):
             shape = Qt.CursorShape.ClosedHandCursor
         elif self._space:
             shape = Qt.CursorShape.OpenHandCursor
-        elif self.main.placing:
+        elif self.main.placing or self.main.calib_pick:
             shape = Qt.CursorShape.CrossCursor
         else:
             shape = Qt.CursorShape.ArrowCursor
@@ -323,13 +391,13 @@ class PanoramaView(QGraphicsView):
             if self.ghost:
                 self.ghost.hide()
             return
-        r = core.diameter_px(pl["mag"]) / 2
+        r = core.diameter_px(pl["mag"], core.pair_scale(self.main.pair(), self.side)) / 2
         if self.ghost is None:
             self.ghost = QGraphicsEllipseItem()
             self.ghost.setZValue(1e6)
             self.ghost.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
             self.scene().addItem(self.ghost)
-        s = self.main.project.settings
+        s = core.side_settings(self.main.project.settings, self.main.pair(), self.side)
         color = QColor(core.object_color(core.new_object(pl["mag"]), s, self.main.pair(), self.side))
         self.ghost.setPen(QPen(color, s["circle_line_px"], Qt.PenStyle.DashLine))
         self.ghost.setBrush(Qt.BrushStyle.NoBrush)
@@ -358,6 +426,11 @@ class PanoramaView(QGraphicsView):
         if e.button() == Qt.MouseButton.LeftButton and self.main.placing:
             self._press = e.position()
             return
+        if e.button() == Qt.MouseButton.LeftButton and not self.main.marking:
+            # «Проверка пар»: точки привязки перетаскиваются, щелчок по пустому месту ставит точку
+            if self.main.calib_pick or not isinstance(self.itemAt(e.position().toPoint()), MarkerItem):
+                self._press = e.position()
+                return
         super().mousePressEvent(e)
 
     def mouseMoveEvent(self, e):
@@ -381,16 +454,19 @@ class PanoramaView(QGraphicsView):
         if self._press is not None and e.button() == Qt.MouseButton.LeftButton:
             moved = (e.position() - self._press).manhattanLength()
             self._press = None
-            if moved < 6 and self.main.placing:
+            if moved < 6 and (self.main.placing or not self.main.marking):
                 p = self.mapToScene(e.position().toPoint())
-                if self.img_size and 0 <= p.x() <= self.img_size[0] and 0 <= p.y() <= self.img_size[1]:
+                if not (self.img_size and 0 <= p.x() <= self.img_size[0] and 0 <= p.y() <= self.img_size[1]):
+                    self.main.statusBar().showMessage("Щёлкните внутри изображения панорамы", 3000)
+                elif self.main.placing:
                     self.main.place_at(self.side, p.x(), p.y())
                 else:
-                    self.main.statusBar().showMessage("Щёлкните внутри изображения панорамы", 3000)
+                    self.main.check_click(self.side, p.x(), p.y())
             return
         super().mouseReleaseEvent(e)
         if e.button() == Qt.MouseButton.LeftButton:
             self.main.sync_positions(self.side)
+            self.main.sync_ties()
 
     def keyPressEvent(self, e):
         if e.key() == Qt.Key.Key_Space and not e.isAutoRepeat():
@@ -518,6 +594,22 @@ def color_icon(*colors, size=16):
     return QIcon(pm)
 
 
+LEVEL_COLORS = {"green": "#16a34a", "yellow": "#ca8a04", "red": "#dc2626", "none": "#9ca3af"}
+
+
+def level_icon(level):
+    """Кружок-индикатор результата проверки размеров пары."""
+    pm = QPixmap(14, 14)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QColor(LEVEL_COLORS[level]))
+    p.drawEllipse(QRectF(2, 2, 10, 10))
+    p.end()
+    return QIcon(pm)
+
+
 def _icon(draw):
     pm = QPixmap(64, 64)
     pm.fill(Qt.GlobalColor.transparent)
@@ -601,6 +693,8 @@ class MainWindow(QMainWindow):
         self.marking = False
         self.syncing = 0
         self.move_alone = False  # Shift при перетаскивании: двигать только на одной панораме
+        self.calib_pick = None   # калибровка по двум точкам: {"side": ..., "points": [...]}
+        self.diag = []           # диагностика размеров по парам
         self.undo, self.redo = {}, {}
         self.worker = None
         self.last_export_dir = ""
@@ -620,7 +714,7 @@ class MainWindow(QMainWindow):
         tb.addAction("Сохранить", self.save_project).setToolTip("Сохранить проект (Ctrl+S)")
         tb.addSeparator()
         group = QActionGroup(self)
-        self.act_view = QAction("Просмотр", self, checkable=True, checked=True)
+        self.act_view = QAction("Проверка пар", self, checkable=True, checked=True)
         self.act_mark = QAction("Разметка", self, checkable=True)
         for a in (self.act_view, self.act_mark):
             group.addAction(a)
@@ -650,7 +744,11 @@ class MainWindow(QMainWindow):
         b_swap.clicked.connect(self.swap_pair)
         b_assign = QPushButton("Назначить файлы…")
         b_assign.clicked.connect(self.assign_files)
-        left, lv = card(self.pair_list, b_swap, b_assign, title="Шлифы")
+        b_del = QPushButton("Удалить из списка…")
+        b_del.setObjectName("danger")
+        b_del.setToolTip("Убрать пару из проекта; исходные фотографии на диске не удаляются")
+        b_del.clicked.connect(self.delete_pair)
+        left, lv = card(self.pair_list, b_swap, b_assign, b_del, title="Шлифы")
 
         # центральная область — две панорамы
         center = QSplitter(Qt.Orientation.Horizontal)
@@ -769,14 +867,16 @@ class MainWindow(QMainWindow):
         rv.addWidget(objects_card, 1)
         rv.addWidget(color_card)
         self.right.setVisible(False)
+        self.right_check = self._build_check_panel()
 
         split = QSplitter(Qt.Orientation.Horizontal)
         split.setHandleWidth(8)
         split.addWidget(left)
         split.addWidget(center)
         split.addWidget(self.right)
+        split.addWidget(self.right_check)
         split.setStretchFactor(1, 1)
-        split.setSizes([230, 1200, 320])
+        split.setSizes([230, 1200, 320, 320])
         outer = QWidget()
         ol = QVBoxLayout(outer)
         ol.setContentsMargins(8, 8, 8, 8)
@@ -784,12 +884,80 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(outer)
         self._update_controls()
         self._update_mag_buttons()
+        self.update_check_panel()
 
         for key, fn in (("1", lambda: self.start_placing("2.5")), ("2", lambda: self.start_placing("5")),
                         ("3", lambda: self.start_placing("10")), ("4", lambda: self.start_placing("20")),
-                        ("Esc", self.stop_placing), ("Delete", self.delete_selected),
+                        ("Esc", self.escape), ("Delete", self.delete_selected),
                         ("Ctrl+S", self.save_project), ("Ctrl+Z", self.do_undo), ("Ctrl+Y", self.do_redo)):
             QShortcut(QKeySequence(key), self, activated=lambda f=fn: self._hotkey(f))
+
+    def _build_check_panel(self):
+        """Правая панель режима «Проверка пар»: размеры, калибровка, точки привязки, статус."""
+        def label():
+            lb = QLabel()
+            lb.setWordWrap(True)
+            lb.setTextFormat(Qt.TextFormat.RichText)
+            return lb
+
+        self.diag_label = label()
+        diag_card, _ = card(self.diag_label, title="Размеры изображений")
+
+        scale_box = QWidget()
+        sl = QVBoxLayout(scale_box)
+        sl.setContentsMargins(0, 0, 0, 0)
+        self.scale_labels, self.ref_radios = {}, {}
+        self.ref_group = QButtonGroup(self)
+        for side in core.SIDES:
+            self.scale_labels[side] = label()
+            sl.addWidget(self.scale_labels[side])
+            row = QWidget()
+            rl = QHBoxLayout(row)
+            rl.setContentsMargins(0, 0, 0, 0)
+            rb = QRadioButton("правильный масштаб")
+            rb.setToolTip("Это изображение — эталон; масштаб второго рассчитывается по точкам привязки")
+            rb.toggled.connect(lambda on, sd=side: on and self.set_ref_side(sd))
+            self.ref_group.addButton(rb)
+            self.ref_radios[side] = rb
+            b = QPushButton("Калибровать")
+            m = QMenu(b)
+            m.addAction("Реальная ширина изображения, мм…", lambda sd=side: self.calib_by_width(sd))
+            m.addAction("Две точки и расстояние между ними…", lambda sd=side: self.calib_by_points(sd))
+            m.addSeparator()
+            m.addAction("Вернуть 4632 px = 21 мм", lambda sd=side: self.reset_calib(sd))
+            b.setMenu(m)
+            rl.addWidget(rb, 1)
+            rl.addWidget(b)
+            sl.addWidget(row)
+        self.derive_label = label()
+        self.derive_btn = QPushButton("Применить масштаб по точкам привязки")
+        self.derive_btn.clicked.connect(self.apply_derived_scale)
+        sl.addWidget(self.derive_label)
+        sl.addWidget(self.derive_btn)
+        scale_card, _ = card(scale_box, title="Масштаб (мм на пиксель)")
+
+        ties_hint = QLabel("Щёлкайте по панорамам, чтобы поставить точки 1, 2, 3 на каждой — в одних и тех же "
+                           "местах шлифа. Точки можно перетаскивать.")
+        ties_hint.setObjectName("hint")
+        ties_hint.setWordWrap(True)
+        self.ties_label = label()
+        b_reset = QPushButton("Сбросить точки")
+        b_reset.clicked.connect(self.reset_ties)
+        ties_card, _ = card(ties_hint, self.ties_label, b_reset, title="Привязка по трём точкам")
+
+        self.reshoot_cb = QCheckBox("Требуется пересъёмка")
+        self.reshoot_cb.setToolTip("Такие пары по умолчанию пропускаются при пакетном экспорте")
+        self.reshoot_cb.toggled.connect(self.set_reshoot)
+        status_card, _ = card(self.reshoot_cb, title="Статус")
+
+        panel = QWidget()
+        pv = QVBoxLayout(panel)
+        pv.setContentsMargins(0, 0, 0, 0)
+        pv.setSpacing(8)
+        for c in (diag_card, scale_card, ties_card, status_card):
+            pv.addWidget(c)
+        pv.addStretch(1)
+        return panel
 
     def _hotkey(self, fn):
         if is_text_input(QApplication.focusWidget()):
@@ -913,8 +1081,8 @@ class MainWindow(QMainWindow):
         self.pair_list.clear()
         for i in range(len(project.pairs)):
             self.pair_list.addItem(QListWidgetItem())
-            self._refresh_pair_item(i)
         self.pair_list.blockSignals(False)
+        self.refresh_diagnostics()
         self._update_title()
         self._update_controls()
         if project.pairs:
@@ -925,9 +1093,26 @@ class MainWindow(QMainWindow):
         missing = [p[s] for s in core.SIDES if p[s] and not os.path.isfile(self.project.image_path(p, s))]
         problem = p["problem"] or ("файл не найден: " + ", ".join(missing) if missing else "")
         item = self.pair_list.item(i)
-        item.setText(("⚠ " if problem else "") + p["name"])
+        item.setText(("⚠ " if problem else "") + p["name"] + (" — пересъёмка" if p["reshoot"] else ""))
         tip = f"Параллельные: {p['parallel'] or '—'}\nСкрещённые: {p['crossed'] or '—'}"
+        d = self.diag[i] if i < len(self.diag) else None
+        if d:
+            item.setIcon(level_icon(d["level"]))
+            if d["diff"] is not None:
+                tip += f"\nРазличие размеров в паре: {d['diff'] * 100:.1f} %"
+            if d["outlier"]:
+                tip += "\nРазмер необычен для выборки"
         item.setToolTip(tip + (f"\n\n{problem}" if problem else ""))
+
+    def refresh_diagnostics(self):
+        """Диагностика разрешений: внутри пары и относительно медианы всей выборки."""
+        if not self.project:
+            return
+        self.diag = core.size_diagnostics(
+            self.project.pairs, lambda p, s: core.image_size(self.project.image_path(p, s)))
+        for i in range(len(self.project.pairs)):
+            self._refresh_pair_item(i)
+        self.update_check_panel()
 
     def save_project(self):
         self.save_timer.stop()
@@ -947,7 +1132,7 @@ class MainWindow(QMainWindow):
         if not self.project or i < 0:
             return
         self.save_project()
-        self.stop_placing()
+        self.escape()
         self.cur, self.sel = i, None
         self.show_pair(fit=True)
         self.rebuild_tree()
@@ -976,9 +1161,11 @@ class MainWindow(QMainWindow):
                 elif path in self.loader.errors:
                     view.load(None, f"Не удалось загрузить:\n{pair[side]}\n{self.loader.errors[path]}")
                 info.append(f"{core.SIDE_TITLES[side]}: {size[0]}×{size[1]} px, "
-                            f"{size[0] * core.MM_PER_PX:.2f} мм")
-            view.build_scale(self.project.settings)
+                            f"{size[0] * core.pair_scale(pair, side):.2f} мм")
+            view.build_scale(self.project.settings, pair)
+            view.build_ties(pair, not self.marking)
         self.rebuild_circles()
+        self.update_check_panel()
         self.statusBar().showMessage(" · ".join(info))
         wanted = [self.project.image_path(pair, s) for s in core.SIDES]
         if self.cur + 1 < len(self.project.pairs):
@@ -999,12 +1186,20 @@ class MainWindow(QMainWindow):
                     view.set_pixmap(img)
                 else:
                     view.load(None, f"Не удалось загрузить:\n{pair[side]}\n{self.loader.errors.get(path, '')}")
-                    view.build_scale(self.project.settings)
                     view.build_circles(None, self.project.settings, False, None)
 
     def fit_views(self):
         for v in self.views.values():
             v.fit()
+
+    def refresh_scale(self):
+        """Пересчёт линеек и диаметров окружностей после смены калибровки или настроек (центры не меняются)."""
+        pair = self.pair()
+        if pair:
+            for side, v in self.views.items():
+                v.build_scale(self.project.settings, pair)
+        self.rebuild_circles()
+        self.update_check_panel()
 
     def rebuild_circles(self):
         if not self.project:
@@ -1041,8 +1236,12 @@ class MainWindow(QMainWindow):
         self.marking = on
         (self.act_mark if on else self.act_view).setChecked(True)
         self.right.setVisible(on)
+        self.right_check.setVisible(not on)
+        self.cancel_calib_pick()
         if not on:
             self.stop_placing()
+        for v in self.views.values():
+            v.build_ties(self.pair(), not on)
         self.rebuild_circles()
 
     def _compress_toggled(self, on):
@@ -1056,9 +1255,7 @@ class MainWindow(QMainWindow):
         dlg = SettingsDialog(self.project.settings, self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self.project.settings.update(dlg.result_settings())
-            for v in self.views.values():
-                v.build_scale(self.project.settings)
-            self.rebuild_circles()
+            self.refresh_scale()
             self.rebuild_tree()
             self.changed()
 
@@ -1150,7 +1347,7 @@ class MainWindow(QMainWindow):
             obj = core.new_object(self.placing["mag"])
             objs.append(obj)
             idx = len(objs) - 1
-        core.place_object(obj, side, x, y, sizes)
+        core.place_object(obj, side, x, y, sizes, core.pair_affine(self.pair(), side, core.other_side(side)))
         self.sel = idx
         self.rebuild_circles()
         self.rebuild_tree()
@@ -1184,19 +1381,21 @@ class MainWindow(QMainWindow):
         o = self.objects()[index]
         alone = self.move_alone
         self.syncing += 1
+        sizes = {sd: v.img_size for sd, v in self.views.items()}
+        affine = core.pair_affine(self.pair(), side, other)
         if kind == "pos":
-            sizes = {sd: v.img_size for sd, v in self.views.items()}
             p = src.pos()
-            target = o["pos"][other] if alone else core.linked_position(o, side, [p.x(), p.y()], sizes)
+            target = o["pos"][other] if alone else core.linked_position(o, side, [p.x(), p.y()], sizes, affine)
             dst.setPos(QPointF(*target))
         else:
-            s = self.project.settings
+            s, pair = self.project.settings, self.pair()
             if alone:
-                target = core.label_offset(o, other, s)
+                target = core.label_offset(o, other, s, pair)
             else:
-                old, old_other = core.label_offset(o, side, s), core.label_offset(o, other, s)
+                old, old_other = core.label_offset(o, side, s, pair), core.label_offset(o, other, s, pair)
                 lp = src.label.pos()
-                target = [old_other[0] + lp.x() - old[0], old_other[1] + lp.y() - old[1]]
+                dx, dy = core.map_delta(lp.x() - old[0], lp.y() - old[1], side, sizes, affine)
+                target = [old_other[0] + dx, old_other[1] + dy]
             dst.label.setPos(QPointF(*target))
         self.syncing -= 1
 
@@ -1211,7 +1410,7 @@ class MainWindow(QMainWindow):
             for i, item in view.circles.items():
                 o = objs[i]
                 p, lp = item.pos(), item.label.pos()
-                old_p, old_l = o["pos"][sd], core.label_offset(o, sd, s)
+                old_p, old_l = o["pos"][sd], core.label_offset(o, sd, s, self.pair())
                 new_p = [p.x(), p.y()] if abs(p.x() - old_p[0]) + abs(p.y() - old_p[1]) > 0.01 else None
                 new_l = [lp.x(), lp.y()] if abs(lp.x() - old_l[0]) + abs(lp.y() - old_l[1]) > 0.01 else None
                 if new_p or new_l:
@@ -1296,9 +1495,9 @@ class MainWindow(QMainWindow):
         if not core.is_placed(o):
             self.statusBar().showMessage("Объект не размещён на панораме", 3000)
             return
-        d = core.diameter_px(o["mag"])
         for side, v in self.views.items():
             if o["pos"][side] and v.img_size:
+                d = core.diameter_px(o["mag"], core.pair_scale(self.pair(), side))
                 v.show_area(o["pos"][side], max(d * 3, 600))
 
     # --- пары
@@ -1329,9 +1528,280 @@ class MainWindow(QMainWindow):
         self.undo.pop(self.cur, None)
         self.redo.pop(self.cur, None)
         self.stop_placing()
-        self._refresh_pair_item(self.cur)
+        self.refresh_diagnostics()
         self.show_pair(fit=True)
         self.changed()
+
+    def delete_pair(self):
+        pair = self.pair()
+        if not pair:
+            return
+        ans = QMessageBox.question(
+            self, "Удаление пары",
+            f"Удалить «{pair['name']}» из списка проекта?\n\n"
+            "Исходные фотографии на диске не удаляются, но разметка этого шлифа будет удалена из проекта.")
+        if ans != QMessageBox.StandardButton.Yes:
+            return
+        i = self.cur
+        self.escape()
+        del self.project.pairs[i]
+        for stacks in (self.undo, self.redo):  # отмена хранится по номеру пары в списке
+            moved = {(k - 1 if k > i else k): v for k, v in stacks.items() if k != i}
+            stacks.clear()
+            stacks.update(moved)
+        self.pair_list.blockSignals(True)
+        self.pair_list.takeItem(i)
+        self.pair_list.blockSignals(False)
+        self.cur, self.sel = -1, None
+        self.refresh_diagnostics()
+        self.save_project()
+        if self.project.pairs:
+            n = min(i, len(self.project.pairs) - 1)
+            self.pair_list.blockSignals(True)
+            self.pair_list.setCurrentRow(n)
+            self.pair_list.blockSignals(False)
+            self.select_pair(n)
+        else:
+            for v in self.views.values():
+                v.load(None, "Нет шлифов")
+            self.rebuild_tree()
+            self.update_check_panel()
+
+    # --- проверка пар: калибровка, точки привязки, статус
+    def escape(self):
+        self.stop_placing()
+        self.cancel_calib_pick()
+
+    def cancel_calib_pick(self):
+        if self.calib_pick:
+            self.calib_pick = None
+            for v in self.views.values():
+                v.show_calib_points([])
+                v.update_cursor()
+            self.statusBar().clearMessage()
+
+    def check_click(self, side, x, y):
+        pair = self.pair()
+        if not pair:
+            return
+        if self.calib_pick:
+            if side != self.calib_pick["side"]:
+                self.statusBar().showMessage(
+                    f"Точки калибровки ставятся на панораме «{core.SIDE_TITLES[self.calib_pick['side']]}»", 4000)
+                return
+            pts = self.calib_pick["points"]
+            pts.append([x, y])
+            self.views[side].show_calib_points(pts)
+            if len(pts) == 2:
+                self._finish_calib_points(side, pts)
+            return
+        ties = pair["ties"][side]
+        if None not in ties:
+            self.statusBar().showMessage("Все три точки на этой панораме уже поставлены — перетащите их "
+                                         "или нажмите «Сбросить точки»", 4000)
+            return
+        ties[ties.index(None)] = [x, y]
+        self.views[side].build_ties(pair, True)
+        self.update_check_panel()
+        self.changed()
+
+    def sync_ties(self):
+        pair = self.pair()
+        if not pair or self.marking:
+            return
+        moved = False
+        for side, v in self.views.items():
+            for n, item in v.ties.items():
+                p = [item.pos().x(), item.pos().y()]
+                old = pair["ties"][side][n]
+                if old and abs(old[0] - p[0]) + abs(old[1] - p[1]) > 0.01:
+                    pair["ties"][side][n] = p
+                    moved = True
+        if moved:
+            self.update_check_panel()
+            self.changed()
+
+    def reset_ties(self):
+        pair = self.pair()
+        if pair:
+            pair["ties"] = {s: [None, None, None] for s in core.SIDES}
+            for v in self.views.values():
+                v.build_ties(pair, not self.marking)
+            self.update_check_panel()
+            self.changed()
+
+    def _set_calib(self, side, mm_per_px, method, note=""):
+        self.pair()["calib"][side] = {"mm_per_px": mm_per_px, "method": method, "note": note}
+        self.refresh_scale()
+        self.changed()
+
+    def calib_by_width(self, side):
+        pair, size = self.pair(), self.views[side].img_size
+        if not pair or not size:
+            return
+        mm, ok = QInputDialog.getDouble(
+            self, "Калибровка по ширине",
+            f"{core.SIDE_TITLES[side]}: {size[0]} px.\nРеальная ширина изображения, мм:",
+            size[0] * core.pair_scale(pair, side), 0.001, 100000, 3)
+        if ok and mm > 0:
+            self._set_calib(side, mm / size[0], "width")
+
+    def calib_by_points(self, side):
+        if not self.pair() or not self.views[side].img_size:
+            return
+        self.stop_placing()
+        self.calib_pick = {"side": side, "points": []}
+        for v in self.views.values():
+            v.update_cursor()
+        self.statusBar().showMessage(f"Калибровка: щёлкните две точки на панораме «{core.SIDE_TITLES[side]}» "
+                                     "с известным расстоянием между ними. Esc — отмена.")
+
+    def _finish_calib_points(self, side, pts):
+        px = math.dist(pts[0], pts[1])
+        current = px * core.pair_scale(self.pair(), side)
+        self.calib_pick = None
+        if px >= 1:
+            mm, ok = QInputDialog.getDouble(self, "Калибровка по двум точкам",
+                                            f"Расстояние между точками A и B ({px:.0f} px), мм:",
+                                            current, 0.001, 100000, 3)
+            if ok and mm > 0:
+                self._set_calib(side, mm / px, "two_points")
+        else:
+            self.statusBar().showMessage("Точки совпадают — калибровка отменена", 4000)
+        for v in self.views.values():
+            v.show_calib_points([])
+            v.update_cursor()
+
+    def reset_calib(self, side):
+        if self.pair():
+            self.pair()["calib"][side] = None
+            self.refresh_scale()
+            self.changed()
+
+    def set_ref_side(self, side):
+        pair = self.pair()
+        if pair and pair["ref_side"] != side:
+            pair["ref_side"] = side
+            self.update_check_panel()
+            self.changed()
+
+    def apply_derived_scale(self):
+        pair = self.pair()
+        res = core.derived_scale(pair) if pair else None
+        if not res:
+            return
+        mm_per_px, info = res
+        target = core.other_side(pair["ref_side"])
+        if info["anisotropy"] > core.ANISOTROPY_LIMIT:
+            pct = info["anisotropy"] * 100
+            ans = QMessageBox.warning(
+                self, "Неодинаковое растяжение по осям",
+                f"Растяжение изображений по разным осям различается на {pct:.1f} %.\n"
+                "Единого точного масштаба для такой пары нет: будет применён средний масштаб, "
+                "отмеченный как приблизительный.\n\nПрименить?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if ans != QMessageBox.StandardButton.Yes:
+                return
+            self._set_calib(target, mm_per_px, "ties_approx", f"растяжение по осям различается на {pct:.1f} %")
+        else:
+            self._set_calib(target, mm_per_px, "ties")
+
+    def set_reshoot(self, on):
+        pair = self.pair()
+        if pair and pair["reshoot"] != on:
+            pair["reshoot"] = on
+            self._refresh_pair_item(self.cur)
+            self.changed()
+
+    def update_check_panel(self):
+        pair = self.pair()
+        d = self.diag[self.cur] if pair and self.cur < len(self.diag) else None
+        names = {"green": "до 5 %", "yellow": "5–15 %", "red": "более 15 %"}
+        lines = []
+        if d:
+            if d["diff"] is not None:
+                lines.append(f"<b style='color:{LEVEL_COLORS[d['level']]}'>●</b> Различие внутри пары: "
+                             f"<b>{d['diff'] * 100:.1f} %</b>")
+            for side in core.SIDES:
+                sz, r = d["sizes"][side], d["ratios"][side]
+                if not sz:
+                    lines.append(f"{core.SIDE_TITLES[side]}: нет изображения")
+                    continue
+                text = f"{core.SIDE_TITLES[side]}: {sz[0]} × {sz[1]} px"
+                if r:
+                    text += f", ×{r:.2f} от медианы выборки"
+                    if r > core.OUTLIER_RATIO or r < 1 / core.OUTLIER_RATIO:
+                        text += f" — <b style='color:{LEVEL_COLORS['yellow']}'>необычно " \
+                                f"{'большое' if r > 1 else 'маленькое'}</b>"
+                lines.append(text)
+            if d["diff"] is not None and d["diff"] > core.PAIR_DIFF_OK:
+                lines.append(f"<span style='color:#6b7280'>Цвет: {names[d['level']]} различия; "
+                             "это диагностика, масштаб автоматически не меняется.</span>")
+        self.diag_label.setText("<br>".join(lines) or "—")
+
+        for side in core.SIDES:
+            sz = self.views[side].img_size if pair else None
+            if pair and sz:
+                mmpp = core.pair_scale(pair, side)
+                ref = " — эталон" if pair["ref_side"] == side else (
+                    " — требует коррекции" if pair["ref_side"] and not pair["calib"][side] else "")
+                approx = pair["calib"][side] and pair["calib"][side]["method"] == "ties_approx"
+                color = LEVEL_COLORS["red"] if approx else "#6b7280"
+                self.scale_labels[side].setText(
+                    f"<b>{core.SIDE_TITLES[side]}</b>{ref}<br>{mmpp:.6f} мм/px · "
+                    f"{sz[0] * mmpp:.2f} × {sz[1] * mmpp:.2f} мм<br>"
+                    f"<span style='color:{color}'>{core.calib_text(pair, side)}</span>")
+            else:
+                self.scale_labels[side].setText(f"<b>{core.SIDE_TITLES[side]}</b><br>—")
+            rb = self.ref_radios[side]
+            rb.blockSignals(True)
+            self.ref_group.setExclusive(False)
+            rb.setChecked(bool(pair) and pair["ref_side"] == side)
+            self.ref_group.setExclusive(True)
+            rb.blockSignals(False)
+            rb.setEnabled(bool(pair))
+
+        res = core.derived_scale(pair) if pair else None
+        if pair and res:
+            mmpp, info = res
+            target = core.other_side(pair["ref_side"])
+            text = (f"По точкам привязки: {core.SIDE_TITLES[target].lower()} — {mmpp:.6f} мм/px; "
+                    f"поворот {info['rotation']:.1f}°, растяжение по осям различается на "
+                    f"{info['anisotropy'] * 100:.1f} %.")
+            if info["anisotropy"] > core.ANISOTROPY_LIMIT:
+                text += (f"<br><b style='color:{LEVEL_COLORS['red']}'>Неодинаковое растяжение по осям — "
+                         "масштаб только приблизительный.</b>")
+            self.derive_label.setText(text)
+        elif pair and not pair["ref_side"]:
+            self.derive_label.setText("<span style='color:#6b7280'>Отметьте изображение с правильным "
+                                      "масштабом, чтобы рассчитать масштаб второго по точкам привязки.</span>")
+        else:
+            self.derive_label.setText("<span style='color:#6b7280'>Для расчёта масштаба нужны три пары "
+                                      "точек привязки.</span>" if pair else "")
+        self.derive_btn.setEnabled(bool(res))
+
+        if pair:
+            counts = " · ".join(f"{core.SIDE_TITLES[s].split()[0]}: {3 - pair['ties'][s].count(None)} из 3"
+                                for s in core.SIDES)
+            t = core.pair_affine(pair, "parallel", "crossed")
+            if t:
+                info = core.affine_info(t)
+                status = (f"Привязка рассчитана: поворот {info['rotation']:.1f}°, масштаб ×{info['scale']:.3f}"
+                          + (" — <b>зеркально: проверьте порядок точек</b>" if info["mirror"] else "") +
+                          ". Используется для размещения и перемещения окружностей.")
+            elif all(None not in pair["ties"][s] for s in core.SIDES):
+                status = f"<b style='color:{LEVEL_COLORS['red']}'>Точки лежат почти на одной прямой — " \
+                         "расставьте их шире.</b>"
+            else:
+                status = "<span style='color:#6b7280'>Без привязки окружности переносятся по относительным " \
+                         "координатам.</span>"
+            self.ties_label.setText(f"{counts}<br>{status}")
+        else:
+            self.ties_label.setText("—")
+        self.reshoot_cb.blockSignals(True)
+        self.reshoot_cb.setChecked(bool(pair) and pair["reshoot"])
+        self.reshoot_cb.setEnabled(bool(pair))
+        self.reshoot_cb.blockSignals(False)
 
     # --- отмена / повтор
     def _snapshot(self):
@@ -1372,6 +1842,23 @@ class MainWindow(QMainWindow):
         pairs = self.project.pairs if all_pairs else ([self.pair()] if self.pair() else [])
         if not pairs:
             return
+        reshoot = [p for p in pairs if p["reshoot"]] if all_pairs else []
+        if reshoot:
+            box = QMessageBox(QMessageBox.Icon.Question, "Экспорт",
+                              f"Шлифов с отметкой «Требуется пересъёмка»: {len(reshoot)}. "
+                              "По умолчанию они не экспортируются.", parent=self)
+            skip = box.addButton("Пропустить их", QMessageBox.ButtonRole.AcceptRole)
+            box.addButton("Экспортировать все", QMessageBox.ButtonRole.ActionRole)
+            cancel = box.addButton(QMessageBox.StandardButton.Cancel)
+            box.setDefaultButton(skip)
+            box.exec()
+            if box.clickedButton() == cancel:
+                return
+            if box.clickedButton() == skip:
+                pairs = [p for p in pairs if not p["reshoot"]]
+            if not pairs:
+                QMessageBox.information(self, "Экспорт", "Нет шлифов для экспорта.")
+                return
         out = QFileDialog.getExistingDirectory(self, "Папка для экспорта", self.last_export_dir)
         if not out:
             return

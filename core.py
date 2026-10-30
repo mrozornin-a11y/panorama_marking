@@ -42,8 +42,8 @@ def mag_label(mag):
     return f"{mag}×"
 
 
-def diameter_px(mag):
-    return MAG_DIAMETER_MM[mag] / MM_PER_PX
+def diameter_px(mag, mm_per_px=MM_PER_PX):
+    return MAG_DIAMETER_MM[mag] / mm_per_px
 
 
 # ---------------------------------------------------------------- пары файлов
@@ -73,13 +73,19 @@ def split_name(filename):
     return stem, False
 
 
-def display_name(base):
+def strip_prefix(base):
+    """Имя без порядкового номера (так называли пары старые версии программы)."""
     return _PREFIX_RE.sub("", base).strip() or base
 
 
 def new_pair(name, parallel, crossed, problem=""):
     return {"name": name, "parallel": parallel, "crossed": crossed, "problem": problem,
-            "color": {"parallel": None, "crossed": None}, "objects": []}
+            "color": {"parallel": None, "crossed": None},
+            "calib": {"parallel": None, "crossed": None},   # {"mm_per_px", "method", "note"} или None
+            "ref_side": None,                                # изображение с правильным масштабом
+            "ties": {"parallel": [None, None, None], "crossed": [None, None, None]},
+            "reshoot": False,
+            "objects": []}
 
 
 def scan_folder(folder):
@@ -92,7 +98,7 @@ def scan_folder(folder):
     pairs, used = [], set()
     for base in sorted(groups, key=natural_key):
         g = groups[base]
-        name = display_name(base)
+        name = base  # порядковый номер из имени файла сохраняется: «16. Г-170»
         unique, n = name, 2
         while unique.casefold() in used:
             unique = f"{name} ({n})"
@@ -134,29 +140,45 @@ def side_colors(value):
     return {s: value for s in SIDES}
 
 
-def place_object(obj, side, x, y, sizes):
-    """Ставит центр на одной панораме, на второй — по относительным координатам."""
-    w, h = sizes[side]
-    rx, ry = x / w, y / h
-    for s in SIDES:
-        sw, sh = sizes[s]
-        obj["pos"][s] = [x, y] if s == side else [rx * sw, ry * sh]
+def other_side(side):
+    return SIDES[1] if side == SIDES[0] else SIDES[0]
 
 
-def linked_position(obj, side, new, sizes):
-    """Положение на второй панораме после перемещения на side: тот же сдвиг в относительных координатах."""
-    other = SIDES[1] if side == SIDES[0] else SIDES[0]
-    old, old_other = obj["pos"][side], obj["pos"][other]
-    kx, ky = sizes[other][0] / sizes[side][0], sizes[other][1] / sizes[side][1]
-    return [old_other[0] + (new[0] - old[0]) * kx, old_other[1] + (new[1] - old[1]) * ky]
+def place_object(obj, side, x, y, sizes, affine=None):
+    """Ставит центр на одной панораме, на второй — по привязке (affine: side → другая)
+    или, если привязки нет, по относительным координатам."""
+    other = other_side(side)
+    obj["pos"][side] = [x, y]
+    if affine:
+        obj["pos"][other] = apply_affine(affine, x, y)
+    else:
+        obj["pos"][other] = [x / sizes[side][0] * sizes[other][0], y / sizes[side][1] * sizes[other][1]]
 
 
-def label_offset(obj, side, settings):
+def map_delta(dx, dy, side, sizes, affine=None):
+    """Сдвиг на панораме side → сдвиг на второй (линейная часть привязки или отношение размеров)."""
+    if affine:
+        a, b, _, d, e, _ = affine
+        return [a * dx + b * dy, d * dx + e * dy]
+    other = other_side(side)
+    return [dx * sizes[other][0] / sizes[side][0], dy * sizes[other][1] / sizes[side][1]]
+
+
+def linked_position(obj, side, new, sizes, affine=None):
+    """Положение на второй панораме после перемещения на side: тот же сдвиг, перенесённый на неё
+    (индивидуальная поправка между панорамами сохраняется)."""
+    old, old_other = obj["pos"][side], obj["pos"][other_side(side)]
+    dx, dy = map_delta(new[0] - old[0], new[1] - old[1], side, sizes, affine)
+    return [old_other[0] + dx, old_other[1] + dy]
+
+
+def label_offset(obj, side, settings, pair=None):
     """Смещение левого верхнего угла номера относительно центра окружности."""
     off = obj["label"][side]
     if off:
         return off
-    d = diameter_px(obj["mag"]) / 2 * 0.7071 + settings["circle_line_px"]
+    line = side_settings(settings, pair, side)["circle_line_px"]
+    d = diameter_px(obj["mag"], pair_scale(pair, side)) / 2 * 0.7071 + line
     return [d, d]
 
 
@@ -165,6 +187,154 @@ def swap_sides(pair):
     for o in pair["objects"]:
         for key in ("pos", "label"):
             o[key]["parallel"], o[key]["crossed"] = o[key]["crossed"], o[key]["parallel"]
+    for key in ("calib", "ties"):  # калибровка и точки привязки относятся к самим изображениям
+        pair[key]["parallel"], pair[key]["crossed"] = pair[key]["crossed"], pair[key]["parallel"]
+    if pair["ref_side"]:
+        pair["ref_side"] = other_side(pair["ref_side"])
+
+
+# ---------------------------------------------------------------- масштаб и привязка
+
+CALIB_METHODS = {
+    "width": "по ширине изображения",
+    "two_points": "по двум точкам",
+    "ties": "по точкам привязки",
+    "ties_approx": "по точкам привязки — ПРИБЛИЗИТЕЛЬНО",
+}
+ANISOTROPY_LIMIT = 0.02  # различие растяжения по осям, выше которого масштаб считается приблизительным
+
+
+def pair_scale(pair, side):
+    """мм/пиксель для панорамы side; по умолчанию — общая калибровка 4632 px = 21 мм."""
+    c = pair["calib"][side] if pair else None
+    return c["mm_per_px"] if c else MM_PER_PX
+
+
+PX_SETTINGS = ("scale_font_px", "scale_line_px", "number_font_px", "circle_line_px")
+
+
+def side_settings(settings, pair, side):
+    """Настройки для панорамы side: размеры в px заданы для калибровки 4632 px = 21 мм и пересчитываются
+    под масштаб изображения, чтобы подписи и линии имели одинаковый физический размер."""
+    k = MM_PER_PX / pair_scale(pair, side)
+    if k == 1:
+        return settings
+    out = dict(settings)
+    for key in PX_SETTINGS:
+        out[key] = max(1.0, settings[key] * k)
+    return out
+
+
+def calib_text(pair, side):
+    c = pair["calib"][side]
+    if not c:
+        return "по умолчанию (4632 px = 21 мм)"
+    text = CALIB_METHODS.get(c["method"], c["method"])
+    return f"{text} ({c['note']})" if c.get("note") else text
+
+
+def _solve3(m, r):
+    """Решение системы 3×3 по правилу Крамера."""
+    def det(a):
+        return (a[0][0] * (a[1][1] * a[2][2] - a[1][2] * a[2][1]) -
+                a[0][1] * (a[1][0] * a[2][2] - a[1][2] * a[2][0]) +
+                a[0][2] * (a[1][0] * a[2][1] - a[1][1] * a[2][0]))
+    d = det(m)
+    out = []
+    for col in range(3):
+        mc = [row[:] for row in m]
+        for i in range(3):
+            mc[i][col] = r[i]
+        out.append(det(mc) / d)
+    return out
+
+
+def _degenerate(pts):
+    """Точки почти на одной прямой (или совпадают)."""
+    (x1, y1), (x2, y2), (x3, y3) = pts
+    area2 = abs((x2 - x1) * (y3 - y1) - (x3 - x1) * (y2 - y1))
+    span = max(math.dist(pts[0], pts[1]), math.dist(pts[1], pts[2]), math.dist(pts[0], pts[2]))
+    return span == 0 or area2 < 0.02 * span * span
+
+
+def pair_affine(pair, src, dst):
+    """Аффинное преобразование по трём парам точек: (x, y) на src → (a·x + b·y + c, d·x + e·y + f) на dst.
+    None, если точки не расставлены полностью или лежат почти на одной прямой."""
+    ps, pd = pair["ties"][src], pair["ties"][dst]
+    if None in ps or None in pd or _degenerate(ps) or _degenerate(pd):
+        return None
+    m = [[x, y, 1.0] for x, y in ps]
+    a, b, c = _solve3(m, [p[0] for p in pd])
+    d, e, f = _solve3(m, [p[1] for p in pd])
+    return (a, b, c, d, e, f)
+
+
+def apply_affine(t, x, y):
+    a, b, c, d, e, f = t
+    return [a * x + b * y + c, d * x + e * y + f]
+
+
+def affine_info(t):
+    """Масштабы вдоль главных направлений, их различие (анизотропия) и угол поворота."""
+    a, b, _, d, e, _ = t
+    E, F, G, H = (a + e) / 2, (a - e) / 2, (d + b) / 2, (d - b) / 2
+    q, r = math.hypot(E, H), math.hypot(F, G)
+    s1, s2 = q + r, abs(q - r)
+    return {"s1": s1, "s2": s2, "scale": math.sqrt(s1 * s2),
+            "anisotropy": s1 / s2 - 1 if s2 else float("inf"),
+            "rotation": math.degrees(math.atan2(H, E)), "mirror": a * e - b * d < 0}
+
+
+def derived_scale(pair):
+    """Масштаб второй панорамы по эталонной и привязке: (мм/px, info) или None."""
+    ref = pair["ref_side"]
+    if not ref:
+        return None
+    t = pair_affine(pair, ref, other_side(ref))
+    if not t:
+        return None
+    info = affine_info(t)
+    if not info["scale"]:
+        return None
+    return pair_scale(pair, ref) / info["scale"], info
+
+
+# ---------------------------------------------------------------- проверка размеров
+
+PAIR_DIFF_OK, PAIR_DIFF_WARN = 0.05, 0.15
+OUTLIER_RATIO = 1.5  # линейный размер отличается от медианы выборки более чем в 1.5 раза
+
+
+def size_diff(a, b):
+    """Наибольшее относительное различие ширины или высоты двух изображений."""
+    return max(abs(a[0] - b[0]) / max(a[0], b[0]), abs(a[1] - b[1]) / max(a[1], b[1]))
+
+
+def size_diagnostics(pairs, size_of):
+    """Диагностика разрешений: для каждой пары level ∈ green/yellow/red/none, различие внутри пары
+    и отношение линейного размера каждого изображения к медиане всей выборки."""
+    sizes = [{s: size_of(p, s) for s in SIDES} for p in pairs]
+    linear = sorted(math.sqrt(w * h) for sz in sizes for v in sz.values() if v for w, h in [v])
+    median = 0.0
+    if linear:
+        n = len(linear)
+        median = linear[n // 2] if n % 2 else (linear[n // 2 - 1] + linear[n // 2]) / 2
+    out = []
+    for sz in sizes:
+        ratios = {s: (math.sqrt(sz[s][0] * sz[s][1]) / median if sz[s] and median else None) for s in SIDES}
+        outlier = any(r and (r > OUTLIER_RATIO or r < 1 / OUTLIER_RATIO) for r in ratios.values())
+        diff = size_diff(sz["parallel"], sz["crossed"]) if all(sz.values()) else None
+        if diff is None:
+            level = "none"
+        elif diff > PAIR_DIFF_WARN:
+            level = "red"
+        elif diff > PAIR_DIFF_OK or outlier:
+            level = "yellow"
+        else:
+            level = "green"
+        out.append({"level": level, "diff": diff, "ratios": ratios, "outlier": outlier,
+                    "sizes": sz, "median": median})
+    return out
 
 
 def drawing_order(objects):
@@ -187,20 +357,20 @@ def scale_field_height(settings):
     return math.ceil(0.9 * f + 0.15 * f + max(2.5 * t, 0.3 * f) + 0.2 * f)
 
 
-def scale_bar(img_w, img_h, settings):
+def scale_bar(img_w, img_h, settings, mm_per_px=MM_PER_PX):
     """Геометрия линейки в координатах исходного изображения (белое поле начинается с y = img_h).
 
     Линейка прижата к правому краю, подпись над ней; поле по высоте минимальное.
     """
     f, t = settings["scale_font_px"], settings["scale_line_px"]
-    mm = choose_scale_mm(img_w * MM_PER_PX)
-    length = mm / MM_PER_PX
+    mm = choose_scale_mm(img_w * mm_per_px)
+    length = mm / mm_per_px
     tick = max(2.5 * t, 0.3 * f)
     baseline = img_h + 0.9 * f
     tick_top = baseline + 0.15 * f
     tick_bottom = tick_top + tick
     bar_y = (tick_top + tick_bottom) / 2
-    x1 = img_w - t / 2  # правый край штриха совпадает с правым краем изображения
+    x1 = img_w - t / 2 - 5  # правый край штриха на 5 px левее правого края изображения
     x0 = x1 - length
     rects = [
         (x0 - t / 2, bar_y - t / 2, x1 + t / 2, bar_y + t / 2),
@@ -215,6 +385,15 @@ def scale_bar(img_w, img_h, settings):
 
 class ProjectError(Exception):
     pass
+
+
+def _restore_number(name, filename):
+    """Старые проекты хранили имя без порядкового номера («Г-170»); возвращаем «16. Г-170» из имени файла."""
+    if filename:
+        base = split_name(filename)[0]
+        if base != name and strip_prefix(base) == name:
+            return base
+    return name
 
 
 class Project:
@@ -255,8 +434,19 @@ class Project:
                 data = json.load(fh)
             pairs = []
             for p in data["pairs"]:
-                pair = new_pair(p["name"], p.get("parallel"), p.get("crossed"), p.get("problem", ""))
+                pair = new_pair(_restore_number(p["name"], p.get("parallel") or p.get("crossed")),
+                                p.get("parallel"), p.get("crossed"), p.get("problem", ""))
                 pair["color"] = side_colors(p.get("color"))
+                for s in SIDES:
+                    c = (p.get("calib") or {}).get(s)
+                    if c and float(c.get("mm_per_px", 0)) > 0:
+                        pair["calib"][s] = {"mm_per_px": float(c["mm_per_px"]), "method": str(c.get("method", "")),
+                                            "note": str(c.get("note", ""))}
+                    ties = (p.get("ties") or {}).get(s) or []
+                    pair["ties"][s] = [[float(t[0]), float(t[1])] if t else None
+                                       for t in (list(ties) + [None, None, None])[:3]]
+                pair["ref_side"] = p.get("ref_side") if p.get("ref_side") in SIDES else None
+                pair["reshoot"] = bool(p.get("reshoot", False))
                 for o in p.get("objects", []):
                     obj = new_object(o["mag"] if o.get("mag") in MAGS else "5")
                     obj["color"] = side_colors(o.get("color"))
@@ -359,13 +549,13 @@ def draw_circle(canvas, cx, cy, r, rgb, settings):
     canvas.paste(region.convert("RGB"), (x0, y0))
 
 
-def render_panorama(path, settings):
+def render_panorama(path, settings, mm_per_px=MM_PER_PX):
     """Исходная панорама + белое поле с линейкой. Возвращает (изображение, исходный размер)."""
     with Image.open(path) as im:
         im.load()
         src = to_rgb(im)
     w, h = src.size
-    sb = scale_bar(w, h, settings)
+    sb = scale_bar(w, h, settings, mm_per_px)
     out = Image.new("RGB", (w, h + sb["field_h"]), "white")
     out.paste(src, (0, 0))
     del src
@@ -407,7 +597,8 @@ def export_pair(pair, image_dir, settings, out_root):
 
     imgs, sizes = {}, {}
     for side in SIDES:
-        img, sizes[side] = render_panorama(os.path.join(image_dir, pair[side]), settings)
+        img, sizes[side] = render_panorama(os.path.join(image_dir, pair[side]),
+                                           side_settings(settings, pair, side), pair_scale(pair, side))
         save_jpeg(img, os.path.join(folder, f"{name} {SIDE_FILE_SUFFIX[side]}.jpg"), settings)
         imgs[side] = img
 
@@ -427,9 +618,10 @@ def export_pair(pair, image_dir, settings, out_root):
 
     draw = ImageDraw.Draw(canvas)
     title_font = load_font(f)
-    num_font = load_font(settings["number_font_px"])
     for side in SIDES:
         ox, oy = offs[side]
+        ss = side_settings(settings, pair, side)
+        num_font = load_font(ss["number_font_px"])
         draw.text((ox + sizes[side][0] / 2, oy - 0.5 * f), SIDE_TITLES[side], fill="black",
                   font=title_font, anchor="ms")
         for i in drawing_order(pair["objects"]):
@@ -439,8 +631,8 @@ def export_pair(pair, image_dir, settings, out_root):
                 continue
             rgb = hex_to_rgb(object_color(o, settings, pair, side))
             cx, cy = ox + pos[0], oy + pos[1]
-            draw_circle(canvas, cx, cy, diameter_px(o["mag"]) / 2, rgb, settings)
-            dx, dy = label_offset(o, side, settings)
+            draw_circle(canvas, cx, cy, diameter_px(o["mag"], pair_scale(pair, side)) / 2, rgb, ss)
+            dx, dy = label_offset(o, side, settings, pair)
             draw.text((cx + dx, cy + dy), str(i + 1), fill=rgb, font=num_font, anchor="la")
     save_jpeg(canvas, os.path.join(folder, f"{name} схема.jpg"), settings)
 
