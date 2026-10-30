@@ -84,6 +84,7 @@ def new_pair(name, parallel, crossed, problem=""):
             "calib": {"parallel": None, "crossed": None},   # {"mm_per_px", "method", "note"} или None
             "ref_side": None,                                # изображение с правильным масштабом
             "ties": {"parallel": [None, None, None], "crossed": [None, None, None]},
+            "align": None,  # совмещение: {"ref_side", "matrix" (исправляемое → эталон), "ref_size"}
             "reshoot": False,
             "objects": []}
 
@@ -183,6 +184,7 @@ def label_offset(obj, side, settings, pair=None):
 
 
 def swap_sides(pair):
+    unalign_pair(pair)  # совмещение относится к прежнему назначению изображений
     pair["parallel"], pair["crossed"] = pair["crossed"], pair["parallel"]
     for o in pair["objects"]:
         for key in ("pos", "label"):
@@ -201,11 +203,19 @@ CALIB_METHODS = {
     "ties": "по точкам привязки",
     "ties_approx": "по точкам привязки — ПРИБЛИЗИТЕЛЬНО",
 }
-ANISOTROPY_LIMIT = 0.02  # различие растяжения по осям, выше которого масштаб считается приблизительным
+
+
+def aligned_side(pair):
+    """Исправленное (приведённое к эталону) изображение пары или None, если пара не совмещена."""
+    a = pair.get("align") if pair else None
+    return other_side(a["ref_side"]) if a else None
 
 
 def pair_scale(pair, side):
-    """мм/пиксель для панорамы side; по умолчанию — общая калибровка 4632 px = 21 мм."""
+    """мм/пиксель для панорамы side; по умолчанию — общая калибровка 4632 px = 21 мм.
+    После совмещения исправленное изображение имеет масштаб эталона."""
+    if pair and aligned_side(pair) == side:
+        side = pair["align"]["ref_side"]
     c = pair["calib"][side] if pair else None
     return c["mm_per_px"] if c else MM_PER_PX
 
@@ -274,29 +284,66 @@ def apply_affine(t, x, y):
     return [a * x + b * y + c, d * x + e * y + f]
 
 
-def affine_info(t):
-    """Масштабы вдоль главных направлений, их различие (анизотропия) и угол поворота."""
+def invert_affine(t):
+    a, b, c, d, e, f = t
+    det = a * e - b * d
+    ia, ib, id_, ie = e / det, -b / det, -d / det, a / det
+    return (ia, ib, -(ia * c + ib * f), id_, ie, -(id_ * c + ie * f))
+
+
+def _convert_objects(pair, side, t):
+    """Перевод центров (и ручных смещений номеров) окружностей панорамы side преобразованием t."""
     a, b, _, d, e, _ = t
-    E, F, G, H = (a + e) / 2, (a - e) / 2, (d + b) / 2, (d - b) / 2
-    q, r = math.hypot(E, H), math.hypot(F, G)
-    s1, s2 = q + r, abs(q - r)
-    return {"s1": s1, "s2": s2, "scale": math.sqrt(s1 * s2),
-            "anisotropy": s1 / s2 - 1 if s2 else float("inf"),
-            "rotation": math.degrees(math.atan2(H, E)), "mirror": a * e - b * d < 0}
+    for o in pair["objects"]:
+        if o["pos"][side]:
+            o["pos"][side] = apply_affine(t, *o["pos"][side])
+        off = o["label"][side]
+        if off:
+            o["label"][side] = [a * off[0] + b * off[1], d * off[0] + e * off[1]]
 
 
-def derived_scale(pair):
-    """Масштаб второй панорамы по эталонной и привязке: (мм/px, info) или None."""
+def align_problem(pair):
+    """Почему пару нельзя совместить (текст) или None."""
     ref = pair["ref_side"]
     if not ref:
-        return None
-    t = pair_affine(pair, ref, other_side(ref))
+        return "Выберите эталонное изображение."
+    if any(None in pair["ties"][s] for s in SIDES):
+        return "Поставьте по три точки на обоих изображениях."
+    t = pair_affine(pair, other_side(ref), ref)
     if not t:
+        return "Точки лежат почти на одной прямой — расставьте их шире."
+    if t[0] * t[4] - t[1] * t[3] <= 0:
+        return "Точки на изображениях расставлены в разном порядке."
+    return None
+
+
+def align_pair(pair, ref_size):
+    """Совмещение: исправляемое изображение приводится к координатам и холсту эталона (ref_size).
+    Окружности исправляемой панорамы переводятся в координаты эталона."""
+    if align_problem(pair):
+        return False
+    unalign_pair(pair)
+    ref = pair["ref_side"]
+    t = pair_affine(pair, other_side(ref), ref)
+    _convert_objects(pair, other_side(ref), t)
+    pair["align"] = {"ref_side": ref, "matrix": list(t), "ref_size": list(ref_size)}
+    return True
+
+
+def unalign_pair(pair):
+    """Возврат к исходному отображению: окружности исправляемой панорамы — снова в её исходных координатах."""
+    a = pair.get("align")
+    if a:
+        _convert_objects(pair, other_side(a["ref_side"]), invert_affine(a["matrix"]))
+        pair["align"] = None
+
+
+def warp_params(pair, side):
+    """(размер холста, преобразование «холст эталона → исходное изображение») для исправленной панорамы."""
+    if aligned_side(pair) != side:
         return None
-    info = affine_info(t)
-    if not info["scale"]:
-        return None
-    return pair_scale(pair, ref) / info["scale"], info
+    a = pair["align"]
+    return tuple(a["ref_size"]), invert_affine(a["matrix"])
 
 
 # ---------------------------------------------------------------- проверка размеров
@@ -446,6 +493,10 @@ class Project:
                     pair["ties"][s] = [[float(t[0]), float(t[1])] if t else None
                                        for t in (list(ties) + [None, None, None])[:3]]
                 pair["ref_side"] = p.get("ref_side") if p.get("ref_side") in SIDES else None
+                a = p.get("align")
+                if a and a.get("ref_side") in SIDES and len(a.get("matrix") or []) == 6:
+                    pair["align"] = {"ref_side": a["ref_side"], "matrix": [float(v) for v in a["matrix"]],
+                                     "ref_size": [int(v) for v in a["ref_size"]]}
                 pair["reshoot"] = bool(p.get("reshoot", False))
                 for o in p.get("objects", []):
                     obj = new_object(o["mag"] if o.get("mag") in MAGS else "5")
@@ -549,11 +600,16 @@ def draw_circle(canvas, cx, cy, r, rgb, settings):
     canvas.paste(region.convert("RGB"), (x0, y0))
 
 
-def render_panorama(path, settings, mm_per_px=MM_PER_PX):
-    """Исходная панорама + белое поле с линейкой. Возвращает (изображение, исходный размер)."""
+def render_panorama(path, settings, mm_per_px=MM_PER_PX, warp=None):
+    """Панорама + белое поле с линейкой. Возвращает (изображение, размер панорамы).
+    warp = (размер холста эталона, преобразование холст → исходное): исправленное (совмещённое) изображение."""
     with Image.open(path) as im:
         im.load()
         src = to_rgb(im)
+    if warp:
+        size, t = warp
+        src = src.transform(size, Image.Transform.AFFINE, t, resample=Image.Resampling.BICUBIC,
+                            fillcolor=(255, 255, 255))
     w, h = src.size
     sb = scale_bar(w, h, settings, mm_per_px)
     out = Image.new("RGB", (w, h + sb["field_h"]), "white")
@@ -598,7 +654,8 @@ def export_pair(pair, image_dir, settings, out_root):
     imgs, sizes = {}, {}
     for side in SIDES:
         img, sizes[side] = render_panorama(os.path.join(image_dir, pair[side]),
-                                           side_settings(settings, pair, side), pair_scale(pair, side))
+                                           side_settings(settings, pair, side), pair_scale(pair, side),
+                                           warp_params(pair, side))
         save_jpeg(img, os.path.join(folder, f"{name} {SIDE_FILE_SUFFIX[side]}.jpg"), settings)
         imgs[side] = img
 
